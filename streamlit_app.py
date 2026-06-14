@@ -1,6 +1,6 @@
 """
 车辆总质量预测系统 - Streamlit可视化界面
-基于物理估计 + ML校准，带置信度评估和截尾处理
+基于物理估计 F=ma + ML残差校准 (m_final = m_est + Δm)
 """
 
 import streamlit as st
@@ -11,13 +11,9 @@ from physics_ml_classifier import Config, PhysicsMLPredictor
 from visualization import (
     plot_residual_analysis,
     plot_feature_importance,
-    plot_cv_results,
-    plot_residual_by_region,
     plot_window_comparison,
-    plot_confidence_distribution,
-    plot_trip_summary,
-    generate_mass_time_curve,
-    plot_trim_effect, generate_mass_time_curve_with_comparison,
+    plot_mass_time_curve_interactive,
+    plot_raw_data_distributions,
 )
 
 warnings.filterwarnings('ignore')
@@ -64,7 +60,6 @@ def init_session_state():
         'model_config': None,
         'prediction_results': None,
         'prediction_file_name': None,
-        'confidence_threshold': 0.7,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -114,7 +109,7 @@ def load_data(uploaded_file):
 # ==================== Streamlit应用 ====================
 def main():
     st.markdown('<h1 class="main-header">🚗 车辆总质量预测系统</h1>', unsafe_allow_html=True)
-    st.markdown('<p style="text-align: center; color: #6B7280;">物理估计 + ML校准 | 截尾降噪 | 置信度评估</p>',
+    st.markdown('<p style="text-align: center; color: #6B7280;">物理估计 F=ma + ML残差校准 | m_final = m_est + Δm</p>',
                 unsafe_allow_html=True)
 
     st.sidebar.title("导航菜单")
@@ -140,17 +135,6 @@ def main():
                 st.success("已清除所有数据")
                 st.rerun()
 
-    # 置信度阈值滑块
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 🎯 置信度阈值设置")
-    confidence_threshold = st.sidebar.slider(
-        "置信度阈值", min_value=0.0, max_value=1.0,
-        value=st.session_state.confidence_threshold, step=0.05,
-        help="低于此阈值的窗口将被过滤"
-    )
-    st.session_state.confidence_threshold = confidence_threshold
-    st.sidebar.info(f"当前阈值: {confidence_threshold:.0%}")
-
     page = st.sidebar.radio(
         "选择页面",
         ["🏠 首页", "📊 数据探索", "🎯 模型训练", "🔮 预测分析", "💾 模型管理"]
@@ -168,19 +152,19 @@ def main():
                 <h3>🔬 物理估计层</h3>
                 <p>牛顿第二定律 F=ma</p>
                 <p>Acc>1, Speed>10, Force>2000N</p>
-                <p>3秒二级窗口均值法</p>
-                <p>IQR截尾降噪处理</p>
+                <p>3秒固定窗口 F=ma</p>
+                <p>行程内窗口截尾取中位数</p>
             </div>
             """, unsafe_allow_html=True)
 
         with col2:
             st.markdown("""
             <div class="metric-card">
-                <h3>🤖 ML校准层</h3>
-                <p>16个工况特征</p>
-                <p>GBDT学习修正规律</p>
-                <p>置信度评估体系</p>
-                <p>阈值可控过滤</p>
+                <h3>🤖 ML残差校准层</h3>
+                <p>学习物理估计偏差 Δm</p>
+                <p>m_final = m_est + Δm</p>
+                <p>工况特征驱动修正</p>
+                <p>修正幅度上限 ±30%</p>
             </div>
             """, unsafe_allow_html=True)
 
@@ -188,10 +172,10 @@ def main():
             st.markdown("""
             <div class="metric-card">
                 <h3>🎯 融合预测</h3>
-                <p>截尾→中位数聚合</p>
-                <p>窗口→行程逐层收敛</p>
-                <p>置信度驱动的过滤</p>
-                <p>丰富可视化分析</p>
+                <p>区间600s / 行程60s</p>
+                <p>窗口→行程→区间中位数</p>
+                <p>全窗口参与预测</p>
+                <p>交互式可视化分析</p>
             </div>
             """, unsafe_allow_html=True)
 
@@ -231,6 +215,17 @@ def main():
             with st.expander("📋 数据预览", expanded=True):
                 st.dataframe(df.head(20))
 
+            st.markdown("### 📊 原始数据分布")
+            fig_dist = plot_raw_data_distributions(df)
+            if fig_dist is not None:
+                st.plotly_chart(fig_dist, width='stretch')
+                st.caption(
+                    "车速 / 加速度 / 牵引力分布供参考；"
+                    "红色虚线为当前默认筛选阈值（车速>10 km/h、加速度>1.0 m/s²、牵引力>2000 N）"
+                )
+            else:
+                st.info("未找到可绘制的数值字段（需含 speed_kmh、acceleration_x、force_n 或 mass_kg 等列）")
+
         else:
             st.info("👆 请先上传数据文件")
             uploaded_file = st.file_uploader("上传新数据文件", type=['csv', 'xlsx', 'xls'])
@@ -258,14 +253,17 @@ def main():
             st.success("✅ 模型已训练完成")
 
             metrics = st.session_state.training_metrics
-            col1, col2, col3, col4 = st.columns(4)
+            col1, col2, col3, col4, col5 = st.columns(5)
             with col1:
-                st.metric("训练MAE", f"{metrics.get('mae_kg', 0):.0f} kg")
+                st.metric("ML MAE", f"{metrics.get('mae_kg', 0):.0f} kg")
             with col2:
-                st.metric("训练RMSE", f"{metrics.get('rmse_kg', 0):.0f} kg")
+                st.metric("物理基线 MAE", f"{metrics.get('physics_mae_kg', 0):.0f} kg")
             with col3:
-                st.metric("MAPE", f"{metrics.get('mape', 0):.1f}%")
+                imp = metrics.get('improvement_over_physics_pct', 0)
+                st.metric("相对物理改善", f"{imp:+.1f}%")
             with col4:
+                st.metric("MAPE", f"{metrics.get('mape', 0):.1f}%")
+            with col5:
                 st.metric("R²", f"{metrics.get('r2', 0):.3f}")
 
             if 'cv_mae_mean' in metrics:
@@ -279,56 +277,38 @@ def main():
                 with col3:
                     st.metric("CV R²", f"{metrics.get('cv_r2_mean', 0):.3f}")
 
-            # 训练可视化
+            # 训练可视化（精简：残差分析 + 特征重要性 + 窗口对比）
             if st.session_state.training_history:
                 st.markdown("### 📈 残差分析")
                 fig_residual = plot_residual_analysis(st.session_state.training_history)
                 if fig_residual:
-                    st.plotly_chart(fig_residual, use_container_width=True)
-
-                st.markdown("### 🔝 特征重要性")
-                fig_importance = plot_feature_importance(st.session_state.training_history)
-                if fig_importance:
-                    st.plotly_chart(fig_importance, use_container_width=True)
+                    st.plotly_chart(fig_residual, width='stretch')
 
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.markdown("### 🔄 交叉验证详情")
-                    fig_cv = plot_cv_results(st.session_state.training_history)
-                    if fig_cv:
-                        st.plotly_chart(fig_cv, use_container_width=True)
+                    st.markdown("### 🔝 特征重要性")
+                    fig_importance = plot_feature_importance(st.session_state.training_history)
+                    if fig_importance:
+                        st.plotly_chart(fig_importance, width='stretch')
 
                 with col2:
-                    st.markdown("### 📊 分区间残差")
-                    fig_region = plot_residual_by_region(st.session_state.training_history)
-                    if fig_region:
-                        st.plotly_chart(fig_region, use_container_width=True)
+                    if st.session_state.training_history.get('residuals') is not None:
+                        residuals = st.session_state.training_history['residuals']
+                        abs_residuals = np.abs(residuals)
+                        st.markdown("#### 误差统计")
+                        col_a, col_b = st.columns(2)
+                        with col_a:
+                            st.metric("平均绝对误差", f"{np.mean(abs_residuals):.0f} kg")
+                            st.metric("中位数绝对误差", f"{np.median(abs_residuals):.0f} kg")
+                        with col_b:
+                            st.metric("最大误差", f"{np.max(abs_residuals):.0f} kg")
+                            within_50 = (abs_residuals < 50).sum()
+                            st.metric("误差<50kg占比", f"{within_50 / len(abs_residuals) * 100:.1f}%")
 
-                st.markdown("### 🔍 窗口级别质量对比分析")
+                st.markdown("### 🔍 行程级别质量对比与误差分析")
                 fig_window_comparison = plot_window_comparison(st.session_state.training_history)
                 if fig_window_comparison:
-                    st.plotly_chart(fig_window_comparison, use_container_width=True)
-
-                # 误差统计
-                if st.session_state.training_history.get('residuals') is not None:
-                    residuals = st.session_state.training_history['residuals']
-                    abs_residuals = np.abs(residuals)
-                    st.markdown("#### 误差统计")
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("平均绝对误差", f"{np.mean(abs_residuals):.0f} kg")
-                    with col2:
-                        st.metric("中位数绝对误差", f"{np.median(abs_residuals):.0f} kg")
-                    with col3:
-                        st.metric("最大误差", f"{np.max(abs_residuals):.0f} kg")
-                    with col4:
-                        within_50 = (abs_residuals < 50).sum()
-                        st.metric("误差<50kg占比", f"{within_50 / len(abs_residuals) * 100:.1f}%")
-
-                st.markdown("### ✂️ 截尾效果分析")
-                fig_trim = plot_trim_effect(st.session_state.training_history)
-                if fig_trim:
-                    st.plotly_chart(fig_trim, use_container_width=True)
+                    st.plotly_chart(fig_window_comparison, width='stretch')
 
             st.markdown("---")
             if st.button("🔄 重新训练模型", type="secondary"):
@@ -340,62 +320,6 @@ def main():
 
         # 训练配置表单
         st.markdown("### ⚙️ 模型配置")
-
-        # 初始化预设值
-        if 'preset_values' not in st.session_state:
-            st.session_state.preset_values = {
-                'n_estimators': 100,
-                'max_depth': 4,
-                'learning_rate': 0.05,
-                'min_samples_split': 5,
-                'min_samples_leaf': 2
-            }
-
-        # 快速预设方案（放在表单外部）
-        st.markdown("#### 🎯 快速预设方案")
-        col_preset1, col_preset2, col_preset3 = st.columns(3)
-
-        with col_preset1:
-            if st.button("🛡️ 保守模式", key="preset_conservative", use_container_width=True):
-                st.session_state.preset_values = {
-                    'n_estimators': 30,
-                    'max_depth': 3,
-                    'learning_rate': 0.03,
-                    'min_samples_split': 10,
-                    'min_samples_leaf': 5
-                }
-                st.success("已切换到保守模式")
-                st.rerun()
-
-        with col_preset2:
-            if st.button("⚖️ 平衡模式", key="preset_balanced", use_container_width=True):
-                st.session_state.preset_values = {
-                    'n_estimators': 100,
-                    'max_depth': 4,
-                    'learning_rate': 0.05,
-                    'min_samples_split': 5,
-                    'min_samples_leaf': 2
-                }
-                st.success("已切换到平衡模式")
-                st.rerun()
-
-        with col_preset3:
-            if st.button("🚀 激进模式", key="preset_aggressive", use_container_width=True):
-                st.session_state.preset_values = {
-                    'n_estimators': 200,
-                    'max_depth': 6,
-                    'learning_rate': 0.08,
-                    'min_samples_split': 3,
-                    'min_samples_leaf': 1
-                }
-                st.success("已切换到激进模式")
-                st.rerun()
-
-        st.info(f"📌 当前预设: 树数量={st.session_state.preset_values['n_estimators']}, "
-                f"最大深度={st.session_state.preset_values['max_depth']}, "
-                f"学习率={st.session_state.preset_values['learning_rate']}")
-
-        st.markdown("---")
 
         with st.form("model_training_form"):
             tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -413,13 +337,28 @@ def main():
                     roll_resist_coeff = st.number_input("滚阻系数 f", 0.005, 0.030, 0.015, 0.001, format="%.3f")
 
             with tab2:
+                st.markdown("#### 层级划分（区间 → 行程 → 窗口）")
                 col1, col2 = st.columns(2)
                 with col1:
-                    secondary_window_size = st.number_input("二级窗口大小（秒）", 1.0, 10.0, 3.0, 0.5)
-                    min_secondary_points = st.number_input("二级窗口最少点数", 5, 50, 15, 5)
+                    stop_duration_section = st.number_input(
+                        "区间结束停车时长（秒）", 120, 7200, 600, 60,
+                        help="停车超过此时间视为装卸货，结束当前装载区间，开始新区间。默认 600s"
+                    )
+                    stop_duration_trip = st.number_input(
+                        "行程结束停车时长（秒）", 10, 600, 60, 10,
+                        help="区间内停车超过此时间视为新行程（等灯/休息等）。应远小于区间时长"
+                    )
                 with col2:
-                    min_primary_duration = st.number_input("最小一级窗口时长（秒）", 1.0, 10.0, 3.0, 0.5)
-                    stop_duration_trip = st.number_input("行程结束停车时长（秒）", 60, 3600, 600, 60)
+                    window_size = st.number_input(
+                        "窗口大小（秒）", 1.0, 10.0, 3.0, 0.5,
+                        help="行程内按此时长切窗，每窗直接 F=ma"
+                    )
+                    min_window_points = st.number_input(
+                        "窗口最少有效点数", 5, 50, 15, 5,
+                        help="窗口内通过筛选的有效点少于此数则跳过"
+                    )
+                if stop_duration_trip >= stop_duration_section:
+                    st.warning("行程停车时长应小于区间停车时长，否则无法在同一区间内划分多个行程。")
 
             with tab3:
                 st.markdown("#### 分级加速度阈值")
@@ -431,12 +370,12 @@ def main():
                     light_mass = st.number_input("轻载质量阈值 (kg)", 1500, 3500, 2500, 100,
                                                  help="低于此质量使用轻载加速度阈值")
                 with col2:
-                    accel_heavy = st.number_input("重载阈值 (m/s²)", 0.3, 1.5, 0.5, 0.1,
+                    accel_heavy = st.number_input("重载阈值 (m/s²)", 0.3, 1.5, 1.0, 0.1,
                                                   help="质量>重载阈值时使用")
                     heavy_mass = st.number_input("重载质量阈值 (kg)", 2000, 5000, 3000, 100,
                                                  help="高于此质量使用重载加速度阈值")
                 with col3:
-                    accel_transition = st.number_input("过渡区阈值 (m/s²)", 0.4, 1.5, 0.7, 0.1,
+                    accel_transition = st.number_input("过渡区阈值 (m/s²)", 0.4, 1.5, 1.0, 0.1,
                                                        help="质量在轻载和重载之间时使用")
 
                 st.info(f"轻载(<{light_mass}kg): Acc>{accel_light} | "
@@ -444,19 +383,28 @@ def main():
                         f"过渡区: Acc>{accel_transition}")
 
             with tab4:
+                st.markdown(
+                    "**层级：区间 → 行程 → 窗口(F=ma) → ML校准**。"
+                    "行程内按固定时长切窗，每窗对有效点直接算 F=ma；"
+                    "**截尾仅在行程级**对窗口质量做百分位过滤后取中位数。"
+                )
                 col1, col2 = st.columns(2)
                 with col1:
-                    trim_method = st.selectbox("截尾方法",
-                                               ['iqr', 'percentile', 'adaptive'],
-                                               format_func=lambda x: {
-                                                   'iqr': 'IQR法',
-                                                   'percentile': '百分位法',
-                                                   'adaptive': '自适应'
-                                               }[x])
+                    trim_remove_bottom = st.slider(
+                        "删除下侧数据点 (%)", 0, 49, 5, 5,
+                        help="行程级截尾：去掉该行程内质量最低的前 X% 窗口"
+                    )
                 with col2:
-                    trim_percentile_low = st.slider("截尾下限(%)", 5, 40, 25, 5)
-                    trim_percentile_high = st.slider("截尾上限(%)", 60, 95, 75, 5)
-                min_trim_samples = st.slider("截尾后最少样本数", 2, 10, 3, 1)
+                    trim_remove_top = st.slider(
+                        "删除上侧数据点 (%)", 0, 49, 5, 5,
+                        help="行程级截尾：去掉该行程内质量最高的后 X% 窗口"
+                    )
+                min_trim_samples = st.slider(
+                    "截尾后至少保留窗口数", 1, 10, 3, 1,
+                    help="截尾后若剩余窗口少于此数，则不截尾，使用全部窗口"
+                )
+                if trim_remove_bottom + trim_remove_top >= 50:
+                    st.warning("下侧+上侧删除比例过大，可能导致有效窗口过少，建议合计不超过 40%。")
 
             with tab5:
                 st.markdown("#### 模型类型")
@@ -467,36 +415,20 @@ def main():
                                                  'rf': '随机森林',
                                                  'linear': '线性回归'
                                              }[x])
-
-                st.markdown("#### 超参数调整")
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    n_estimators = st.slider("树的数量", 20, 300,
-                                             st.session_state.preset_values['n_estimators'], 10,
-                                             help="减少可降低过拟合")
-                    max_depth = st.slider("最大深度", 2, 10,
-                                          st.session_state.preset_values['max_depth'], 1,
-                                          help="减小强制学简单规律")
-                with col2:
-                    learning_rate = st.slider("学习率 (GBDT)", 0.01, 0.30,
-                                              st.session_state.preset_values['learning_rate'], 0.01,
-                                              help="减小学得更慢更稳健")
-                    min_samples_split = st.slider("最小样本分割", 2, 20,
-                                                  st.session_state.preset_values['min_samples_split'], 1,
-                                                  help="增大防分裂太细")
-                with col3:
-                    min_samples_leaf = st.slider("最小叶子样本", 1, 10,
-                                                 st.session_state.preset_values['min_samples_leaf'], 1,
-                                                 help="增大防记住单个样本")
-                    n_folds = st.slider("交叉验证折数", 3, 10, 5, 1,
-                                        help="行程少时不宜太多")
-
-                st.markdown("#### 置信度权重")
-                col1, col2 = st.columns(2)
-                with col1:
-                    data_quality_weight = st.slider("数据质量权重", 0.0, 1.0, 0.5, 0.1)
-                with col2:
-                    model_reliability_weight = st.slider("模型可靠度权重", 0.0, 1.0, 0.5, 0.1)
+                st.markdown("#### 超参数设置")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    n_estimators = st.slider("树的数量 (n_estimators)", 50, 500, 200, 10)
+                    max_depth = st.slider("最大深度 (max_depth)", 2, 15, 4, 1)
+                    learning_rate = st.slider("学习率 (learning_rate)", 0.01, 0.3, 0.05, 0.01)
+                with col_b:
+                    min_samples_split = st.slider("最小分割样本 (min_samples_split)", 2, 20, 5, 1)
+                    min_samples_leaf = st.slider("最小叶子样本 (min_samples_leaf)", 1, 10, 2, 1)
+                    n_folds = st.slider("交叉验证折数 (n_folds)", 3, 10, 5, 1)
+                if ml_model_type == 'linear':
+                    st.info("线性回归不使用树相关参数，仅 n_folds 生效。")
+                else:
+                    st.info("GBDT/RF 学习物理估计残差 Δm，最终质量 = m_est + Δm")
 
             train_button = st.form_submit_button("开始训练模型")
 
@@ -516,16 +448,15 @@ def main():
                     config.MIN_SPEED = min_speed
                     config.MIN_FORCE = min_force
                     config.ROLLING_RESISTANCE_COEFF = roll_resist_coeff
-                    config.SECONDARY_WINDOW_SIZE = secondary_window_size
-                    config.MIN_SECONDARY_WINDOW_POINTS = min_secondary_points
-                    config.MIN_PRIMARY_WINDOW_DURATION = min_primary_duration
+                    config.WINDOW_SIZE = window_size
+                    config.SECONDARY_WINDOW_SIZE = window_size
+                    config.MIN_WINDOW_POINTS = min_window_points
+                    config.MIN_SECONDARY_WINDOW_POINTS = min_window_points
+                    config.MIN_STOP_DURATION_FOR_SECTION_END = stop_duration_section
                     config.MIN_STOP_DURATION_FOR_TRIP_END = stop_duration_trip
-                    config.TRIM_METHOD = trim_method
-                    config.TRIM_PERCENTILE_LOW = trim_percentile_low
-                    config.TRIM_PERCENTILE_HIGH = trim_percentile_high
+                    config.TRIM_REMOVE_BOTTOM_PCT = trim_remove_bottom
+                    config.TRIM_REMOVE_TOP_PCT = trim_remove_top
                     config.MIN_TRIM_SAMPLES = min_trim_samples
-                    config.DATA_QUALITY_WEIGHT = data_quality_weight
-                    config.MODEL_RELIABILITY_WEIGHT = model_reliability_weight
 
                     progress_bar.progress(10)
                     status_text.text("🔄 初始化预测器...")
@@ -540,7 +471,7 @@ def main():
                         ml_model_type=ml_model_type,
                         n_estimators=n_estimators,
                         max_depth=max_depth,
-                        learning_rate=learning_rate if ml_model_type == 'gbdt' else None,
+                        learning_rate=learning_rate,
                         min_samples_split=min_samples_split,
                         min_samples_leaf=min_samples_leaf,
                         n_folds=n_folds,
@@ -556,12 +487,19 @@ def main():
                     st.session_state.model_config = {
                         'min_accel': min_accel, 'min_speed': min_speed,
                         'min_force': min_force, 'roll_resist_coeff': roll_resist_coeff,
-                        'secondary_window_size': secondary_window_size,
-                        'min_secondary_points': min_secondary_points,
-                        'min_primary_duration': min_primary_duration,
+                        'window_size': window_size,
+                        'min_window_points': min_window_points,
+                        'stop_duration_section': stop_duration_section,
                         'stop_duration_trip': stop_duration_trip,
-                        'trim_method': trim_method,
+                        'trim_remove_bottom': trim_remove_bottom,
+                        'trim_remove_top': trim_remove_top,
                         'ml_model_type': ml_model_type,
+                        'n_estimators': n_estimators,
+                        'max_depth': max_depth,
+                        'learning_rate': learning_rate,
+                        'min_samples_split': min_samples_split,
+                        'min_samples_leaf': min_samples_leaf,
+                        'n_folds': n_folds,
                     }
 
                     progress_bar.progress(100)
@@ -584,16 +522,18 @@ def main():
 
         predictor = st.session_state.predictor
 
-        st.info(f"✅ 模型已加载 | 当前置信度阈值: {st.session_state.confidence_threshold:.0%}")
+        st.info("✅ 模型已加载 | 所有有效窗口均参与预测聚合")
 
         if st.session_state.training_metrics:
             metrics = st.session_state.training_metrics
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric("模型MAE", f"{metrics.get('mae_kg', 0):.0f} kg")
+                st.metric("ML MAE", f"{metrics.get('mae_kg', 0):.0f} kg")
             with col2:
-                st.metric("模型MAPE", f"{metrics.get('mape', 0):.1f}%")
+                st.metric("物理基线 MAE", f"{metrics.get('physics_mae_kg', 0):.0f} kg")
             with col3:
+                st.metric("MAPE", f"{metrics.get('mape', 0):.1f}%")
+            with col4:
                 st.metric("R²", f"{metrics.get('r2', 0):.3f}")
 
         if st.session_state.prediction_results is not None:
@@ -612,30 +552,19 @@ def main():
                 if 'trip_results' in results:
                     st.metric("有效行程数", f"{len(results['trip_results'])}")
 
-            st.markdown("### 📈 质量时间曲线")
+            st.markdown("### 📈 质量预测时间曲线")
             if 'predictions_df' in results:
-                image_buf = generate_mass_time_curve(results['predictions_df'])
-                if image_buf is not None:
-                    st.image(image_buf, caption="质量预测时间曲线", use_column_width=True)
+                fig_curve = plot_mass_time_curve_interactive(
+                    results['predictions_df'],
+                    trip_results=results.get('trip_results'),
+                    section_results=results.get('section_results'),
+                )
+                if fig_curve is not None:
+                    st.plotly_chart(fig_curve, width='stretch', key='mass_time_curve_plotly')
+                else:
+                    st.warning("无法生成质量时间曲线，请确认预测结果中包含 time_seconds 列。")
 
-            st.markdown("### 📊 置信度分析")
-            if 'trip_results' in results:
-                fig_conf = plot_confidence_distribution(results['trip_results'])
-                if fig_conf:
-                    st.plotly_chart(fig_conf, use_container_width=True)
-
-            st.markdown("### 📊 行程汇总")
-            if 'trip_results' in results:
-                fig_trip = plot_trip_summary(results['trip_results'])
-                if fig_trip:
-                    st.plotly_chart(fig_trip, use_container_width=True)
-
-            # 修改 streamlit_app.py 中的行程详情显示部分
-
-            # 在预测结果显示部分，将原来的
-            results = st.session_state.prediction_results
-
-            # 行程详情部分改为同时显示区间和行程
+            # 行程详情部分
             st.markdown("### 📊 区间汇总（主要输出）")
             if 'section_results' in results:
                 section_detail = []
@@ -643,85 +572,32 @@ def main():
                     section_detail.append({
                         '区间ID': s['section_idx'],
                         '区间质量(kg)': f"{s['ml_mass']:.0f}",
-                        '置信度': f"{s['confidence']:.2f}",
                         '包含行程数': s['n_trips'],
                         '总窗口数': s['n_total_windows'],
                         '开始时间': f"{s['start_time']:.0f}s",
                         '结束时间': f"{s['end_time']:.0f}s",
                     })
-                st.dataframe(pd.DataFrame(section_detail), use_container_width=True)
+                st.dataframe(pd.DataFrame(section_detail), width='stretch')
 
-            st.markdown("### 📋 行程详情（辅助参考）")
+            st.markdown("### 📋 行程对比详情")
             if 'trip_results' in results:
-                trip_detail = []
+                comparison_detail = []
                 for t in results['trip_results']:
-                    trip_detail.append({
+                    comparison_detail.append({
                         '行程ID': t['trip_idx'],
                         '所属区间': t.get('section_id', 'N/A'),
-                        '质量(kg)': f"{t.get('ml_mass', t.get('mass', 0)):.0f}",
-                        '置信度': f"{t['confidence']:.2f}",
-                        '有效窗口': t['n_windows'],
-                        '开始时间': f"{t['start_time']:.0f}s",
+                        '物理估计(kg)': f"{t['physical_mass']:.0f}",
+                        'ML校准(kg)': f"{t['ml_mass']:.0f}",
+                        '差异(kg)': f"{abs(t['physical_mass'] - t['ml_mass']):.0f}",
+                        '窗口总数': t.get('n_primary_windows', '—'),
                     })
-                st.dataframe(pd.DataFrame(trip_detail), use_container_width=True)
+                st.dataframe(pd.DataFrame(comparison_detail), width='stretch')
 
             st.markdown("### 💾 下载预测结果")
             if 'predictions_df' in results:
                 csv = results['predictions_df'].to_csv(index=False).encode('utf-8-sig')
                 st.download_button(label="下载CSV格式结果", data=csv,
                                  file_name="prediction_results.csv", mime="text/csv")
-
-                # 添加对比分析部分
-                st.markdown("### 🔬 物理估计 vs 🤖 ML校准 对比分析")
-
-                # 新增：对比曲线图
-                st.markdown("#### 📈 质量时间曲线对比")
-                comparison_buf = generate_mass_time_curve_with_comparison(results['predictions_df'])
-                if comparison_buf is not None:
-                    st.image(comparison_buf, caption="物理估计(蓝) vs ML校准(绿) 对比", use_column_width=True)
-
-                # 新增：散点对比图
-                from visualization import plot_physical_vs_ml_comparison, plot_error_decomposition
-
-                if 'trip_results' in results:
-                    fig_comparison = plot_physical_vs_ml_comparison(results['trip_results'])
-                    if fig_comparison:
-                        st.plotly_chart(fig_comparison, use_container_width=True)
-
-                    # 新增：误差分解图
-                    st.markdown("### 📊 ML改进效果分析")
-                    fig_decomposition = plot_error_decomposition(results['trip_results'])
-                    if fig_decomposition:
-                        st.plotly_chart(fig_decomposition, use_container_width=True)
-
-                # 新增：行程对比表格
-                st.markdown("### 📋 行程对比详情")
-                if 'trip_results' in results:
-                    comparison_detail = []
-                    for t in results['trip_results']:
-                        comparison_detail.append({
-                            '行程ID': t['trip_idx'],
-                            '物理估计质量(kg)': f"{t['physical_mass']:.0f}",
-                            'ML校准质量(kg)': f"{t['ml_mass']:.0f}",
-                            '差异(kg)': f"{abs(t['physical_mass'] - t['ml_mass']):.0f}",
-                            '改进幅度(%)': f"{t['improvement_pct']:.1f}%",
-                            '置信度': f"{t['confidence']:.2f}",
-                            '有效窗口数': t['n_windows'],
-                            '物理估计标准差': f"{t.get('physical_std', 0):.0f}",
-                            'ML校准标准差': f"{t.get('ml_std', 0):.0f}",
-                        })
-                    st.dataframe(pd.DataFrame(comparison_detail), use_container_width=True)
-
-                    # 显示汇总统计
-                    total_improvement = np.mean([t['improvement_pct'] for t in results['trip_results']])
-                    st.info(f"📊 **汇总**: ML校准平均改进了 {total_improvement:.1f}% 的预测精度")
-
-                    if total_improvement < 5:
-                        st.info("💡 **分析**: 改进幅度较小，说明物理模型已经比较准确，数据质量可能是主要限制因素")
-                    elif total_improvement < 15:
-                        st.info("💡 **分析**: 中等改进，ML模型有效学习了工况修正规律")
-                    else:
-                        st.success("💡 **分析**: 显著改进！ML模型大幅提升了预测精度，源数据噪声较大但模型有效去噪")
 
             if st.button("进行新的预测"):
                 st.session_state.prediction_results = None
@@ -748,10 +624,7 @@ def main():
                         with st.spinner("正在执行预测..."):
                             try:
                                 # 确保使用带对比的预测方法
-                                results = predictor.predict_with_comparison(  # 注意这里的方法名
-                                    pred_df,
-                                    confidence_threshold=st.session_state.confidence_threshold
-                                )
+                                results = predictor.predict_with_comparison(pred_df)
                                 st.session_state.prediction_results = results
                                 st.session_state.prediction_file_name = pred_file.name
                                 st.success("✅ 预测完成！")

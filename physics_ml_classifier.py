@@ -1,6 +1,6 @@
 """
-车辆总质量预测系统 - 物理估计 + ML校准
-基于加速工况的物理模型 + 机器学习残差校准
+车辆总质量预测系统 - 物理估计 + ML残差校准
+基于加速工况的物理模型 F=ma + 机器学习预测残差 (m_true - m_est)
 带置信度评估和阈值过滤
 """
 
@@ -33,19 +33,23 @@ class Config:
     MIN_SPEED_FOR_TRAINING = 0.1
 
     # 窗口划分参数
+    # 窗口参数（行程内按固定时长切窗，直接 F=ma）
+    WINDOW_SIZE = 3.0              # 窗口大小（秒），与 SECONDARY_WINDOW_SIZE 同步
+    SECONDARY_WINDOW_SIZE = 3.0    # 兼容旧模型字段名
+    MIN_WINDOW_POINTS = 15         # 窗口内至少有效点数
+    MIN_SECONDARY_WINDOW_POINTS = 15  # 兼容旧模型字段名
+    # 以下字段保留兼容，不再使用
     MIN_PRIMARY_WINDOW_DURATION = 3.0
-    SECONDARY_WINDOW_SIZE = 3.0
-    MIN_SECONDARY_WINDOW_POINTS = 15
-    MIN_SECONDARY_WINDOWS_PER_PRIMARY = 2
+    MIN_SECONDARY_WINDOWS_PER_PRIMARY = 1
     SAMPLING_RATE = 10.0
-    MIN_STOP_DURATION_FOR_TRIP_END = 60.0
+    MIN_STOP_DURATION_FOR_TRIP_END = 60.0      # 行程：停车超过此秒数 → 新行程
     MIN_STOP_DURATION_FOR_WINDOW_END = 2.0
 
     # 加速度筛选参数 - 分级阈值
     MIN_ACCEL = 1.0  # 基础最小加速度阈值 (m/s²)
     MIN_ACCEL_LIGHT = 1.0  # 轻载(<2500kg)的最小加速度
-    MIN_ACCEL_HEAVY = 0.5  # 重载(>3000kg)的最小加速度
-    MIN_ACCEL_TRANSITION = 0.7  # 过渡区(2500-3000kg)的最小加速度
+    MIN_ACCEL_HEAVY = 1.0  # 重载(>3000kg)的最小加速度
+    MIN_ACCEL_TRANSITION = 1.0  # 过渡区(2500-3000kg)的最小加速度
     LIGHT_MASS_THRESHOLD = 2500  # 轻载阈值(kg)
     HEAVY_MASS_THRESHOLD = 3000  # 重载阈值(kg)
     MIN_SPEED = 10.0
@@ -60,28 +64,26 @@ class Config:
     ROLLING_RESISTANCE_COEFF = 0.015
     GRAVITY = 9.81
 
-    # 截尾参数
-    TRIM_METHOD = 'iqr'
-    TRIM_PERCENTILE_LOW = 25
-    TRIM_PERCENTILE_HIGH = 75
-    TRIM_IQR_MULTIPLIER = 1.5
-    MIN_TRIM_SAMPLES = 3
+    # 截尾参数（一级窗口百分位截尾：每个行程内去掉两端偏离较大的窗口）
+    TRIM_REMOVE_BOTTOM_PCT = 5    # 删除质量最低的下 X% 一级窗口（行程级截尾）
+    TRIM_REMOVE_TOP_PCT = 5       # 删除质量最高的上 X% 一级窗口（行程级截尾）
+    MIN_TRIM_SAMPLES = 3          # 截尾后至少保留的一级窗口数
 
-    # 置信度参数
-    CONFIDENCE_THRESHOLD = 0.7
-    DATA_QUALITY_WEIGHT = 0.5
-    MODEL_RELIABILITY_WEIGHT = 0.5
-
-    # 区间划分参数
-    MIN_STOP_DURATION_FOR_SECTION_END = 600.0  # 区间结束的最小停车时长(秒)
+    # 区间划分：停车超过此秒数 → 新区间（装卸货），默认 600s
+    MIN_STOP_DURATION_FOR_SECTION_END = 600.0
 
     # ML模型参数
-    RF_N_ESTIMATORS = 100
+    PREDICTION_MODE = 'residual'
+    MAX_RELATIVE_CORRECTION = 0.30
+    MIN_MASS_KG = 500
+    MAX_MASS_KG = 50000
+
+    RF_N_ESTIMATORS = 200
     RF_MAX_DEPTH = 10
     RF_MIN_SAMPLES_SPLIT = 5
     RF_MIN_SAMPLES_LEAF = 2
 
-    GBDT_N_ESTIMATORS = 100
+    GBDT_N_ESTIMATORS = 200
     GBDT_MAX_DEPTH = 4
     GBDT_LEARNING_RATE = 0.05
     GBDT_MIN_SAMPLES_SPLIT = 5
@@ -334,47 +336,38 @@ class PhysicsEstimator:
         return trips
 
     def split_primary_windows(self, df: pd.DataFrame) -> List[pd.DataFrame]:
-        """从有效点中划分一级窗口"""
+        """
+        行程内按固定时长切窗（从行程起点对齐、不重叠）。
+        每个窗口含该时段内全部采样点，F=ma 在 estimate_primary_window_mass 中对有效点计算。
+        """
         if 'is_valid' not in df.columns:
             raise ValueError("请先执行 filter_valid_points")
 
-        valid_df = df[df['is_valid'] == 1].copy()
-
-        if len(valid_df) == 0:
+        if len(df) == 0:
             return []
 
+        df = df.sort_values('time_seconds').reset_index(drop=True)
+        window_size = self.config.WINDOW_SIZE
+        trip_start = float(df['time_seconds'].iloc[0])
+        trip_end = float(df['time_seconds'].iloc[-1])
+
         windows = []
-        current_window = [valid_df.index[0]]
-
-        for i in range(1, len(valid_df)):
-            time_diff = valid_df['time_seconds'].iloc[i] - valid_df['time_seconds'].iloc[i-1]
-
-            if time_diff <= 0.2:
-                current_window.append(valid_df.index[i])
-            else:
-                window_indices = current_window
-                window_df = df.loc[window_indices].copy()
-                duration = window_df['time_seconds'].iloc[-1] - window_df['time_seconds'].iloc[0]
-
-                if duration >= self.config.MIN_PRIMARY_WINDOW_DURATION:
-                    windows.append(window_df)
-
-                current_window = [valid_df.index[i]]
-
-        if current_window:
-            window_indices = current_window
-            window_df = df.loc[window_indices].copy()
-            duration = window_df['time_seconds'].iloc[-1] - window_df['time_seconds'].iloc[0]
-
-            if duration >= self.config.MIN_PRIMARY_WINDOW_DURATION:
+        current_start = trip_start
+        while current_start + window_size <= trip_end:
+            current_end = current_start + window_size
+            mask = (df['time_seconds'] >= current_start) & (df['time_seconds'] < current_end)
+            window_df = df.loc[mask].copy()
+            if len(window_df) > 0:
                 windows.append(window_df)
+            current_start = current_end
 
-        logger.info(f"一级窗口划分完成: {len(windows)} 个")
+        logger.info(f"行程窗口划分完成: {len(windows)} 个 (每窗 {window_size}s)")
         return windows
 
-    def calculate_secondary_window_mass(self, window_df: pd.DataFrame) -> Optional[float]:
-        """计算单个二级窗口的质量估计"""
-        if len(window_df) < self.config.MIN_SECONDARY_WINDOW_POINTS:
+    def calculate_window_mass(self, window_df: pd.DataFrame) -> Optional[float]:
+        """对单个时间窗口内的有效点计算 F=ma 质量"""
+        min_pts = self.config.MIN_WINDOW_POINTS
+        if len(window_df) < min_pts:
             return None
 
         if 'force_n' in window_df.columns:
@@ -402,101 +395,69 @@ class PhysicsEstimator:
 
         return float(m_est)
 
-    def estimate_primary_window_mass(self, primary_window: pd.DataFrame) -> Dict[str, Any]:
-        """估计一级窗口的质量（带截尾处理）"""
-        valid_data = primary_window[primary_window['is_valid'] == 1].copy()
+    calculate_secondary_window_mass = calculate_window_mass  # 兼容旧名称
 
-        if len(valid_data) == 0:
-            return {'m_est': None, 'n_secondary': 0, 'm_est_list': [], 'm_est_cv': 0, 'trimmed_m_est_list': []}
+    def estimate_primary_window_mass(self, window_df: pd.DataFrame) -> Dict[str, Any]:
+        """对单个时间窗口：取有效点，直接 F=ma（截尾在行程级进行）"""
+        valid_data = window_df[window_df['is_valid'] == 1].copy()
+        min_pts = self.config.MIN_WINDOW_POINTS
 
-        start_time = valid_data['time_seconds'].iloc[0]
-        end_time = valid_data['time_seconds'].iloc[-1]
+        if len(valid_data) < min_pts:
+            return {'m_est': None, 'n_secondary': len(valid_data), 'm_est_list': [], 'm_est_cv': 0}
 
-        secondary_masses = []
-
-        current_start = start_time
-        while current_start + self.config.SECONDARY_WINDOW_SIZE <= end_time:
-            current_end = current_start + self.config.SECONDARY_WINDOW_SIZE
-
-            mask = (valid_data['time_seconds'] >= current_start) & \
-                   (valid_data['time_seconds'] < current_end)
-            secondary_window = valid_data[mask]
-
-            if len(secondary_window) >= self.config.MIN_SECONDARY_WINDOW_POINTS:
-                m_est = self.calculate_secondary_window_mass(secondary_window)
-                if m_est is not None:
-                    secondary_masses.append(m_est)
-
-            current_start = current_end
-
-        if len(secondary_masses) < self.config.MIN_SECONDARY_WINDOWS_PER_PRIMARY:
-            return {'m_est': None, 'n_secondary': len(secondary_masses), 'm_est_list': secondary_masses, 'm_est_cv': 0, 'trimmed_m_est_list': []}
-
-        # 截尾处理：保留中间部分的二级窗口
-        trimmed_masses = self._trim_secondary_masses(secondary_masses)
-
-        if len(trimmed_masses) < self.config.MIN_TRIM_SAMPLES:
-            # 截尾后样本太少，使用原始数据
-            trimmed_masses = secondary_masses
-
-        m_est_median = float(np.median(trimmed_masses))
-        m_est_cv = float(np.std(trimmed_masses) / np.mean(trimmed_masses)) if len(trimmed_masses) > 1 else 0.0
+        m_est = self.calculate_window_mass(valid_data)
+        if m_est is None:
+            return {'m_est': None, 'n_secondary': len(valid_data), 'm_est_list': [], 'm_est_cv': 0}
 
         return {
-            'm_est': m_est_median,
-            'n_secondary': len(secondary_masses),
-            'n_trimmed': len(trimmed_masses),
-            'm_est_list': secondary_masses,
-            'trimmed_m_est_list': trimmed_masses,
-            'm_est_cv': m_est_cv,
-            'trimmed_ratio': len(trimmed_masses) / len(secondary_masses) if len(secondary_masses) > 0 else 0.0,
+            'm_est': m_est,
+            'n_secondary': len(valid_data),
+            'm_est_list': [m_est],
+            'm_est_cv': 0.0,
         }
 
-    def _trim_secondary_masses(self, masses: List[float]) -> List[float]:
-        """对二级窗口质量列表进行截尾处理"""
-        if len(masses) < 4:
-            return masses
+    def get_trim_indices(self, masses: List[float]) -> List[int]:
+        """行程级百分位截尾：返回保留的一级窗口下标（仅行程聚合时使用）"""
+        n = len(masses)
+        if n == 0:
+            return []
+        if n < 2:
+            return list(range(n))
 
-        masses_array = np.array(masses)
+        bottom_n = int(n * self.config.TRIM_REMOVE_BOTTOM_PCT / 100.0)
+        top_n = int(n * self.config.TRIM_REMOVE_TOP_PCT / 100.0)
 
-        if self.config.TRIM_METHOD == 'iqr':
-            # 基于IQR的截尾
-            q1 = np.percentile(masses_array, 25)
-            q3 = np.percentile(masses_array, 75)
-            iqr = q3 - q1
-            lower_bound = q1 - self.config.TRIM_IQR_MULTIPLIER * iqr
-            upper_bound = q3 + self.config.TRIM_IQR_MULTIPLIER * iqr
-            mask = (masses_array >= lower_bound) & (masses_array <= upper_bound)
-            trimmed = masses_array[mask].tolist()
+        if bottom_n + top_n >= n:
+            return list(range(n))
 
-        elif self.config.TRIM_METHOD == 'percentile':
-            # 基于百分位的截尾
-            lower = np.percentile(masses_array, self.config.TRIM_PERCENTILE_LOW)
-            upper = np.percentile(masses_array, self.config.TRIM_PERCENTILE_HIGH)
-            mask = (masses_array >= lower) & (masses_array <= upper)
-            trimmed = masses_array[mask].tolist()
+        sorted_indices = sorted(range(n), key=lambda i: masses[i])
+        kept = sorted_indices[bottom_n:n - top_n] if top_n > 0 else sorted_indices[bottom_n:]
 
-        elif self.config.TRIM_METHOD == 'adaptive':
-            # 自适应截尾：基于CV值动态调整
-            cv = np.std(masses_array) / np.mean(masses_array) if np.mean(masses_array) > 0 else 0
+        if len(kept) < self.config.MIN_TRIM_SAMPLES:
+            return list(range(n))
 
-            if cv < 0.05:
-                trim_pct = 10
-            elif cv < 0.10:
-                trim_pct = 20
-            elif cv < 0.15:
-                trim_pct = 30
-            else:
-                trim_pct = 40
+        return sorted(kept)
 
-            lower = np.percentile(masses_array, trim_pct)
-            upper = np.percentile(masses_array, 100 - trim_pct)
-            mask = (masses_array >= lower) & (masses_array <= upper)
-            trimmed = masses_array[mask].tolist()
-        else:
-            trimmed = masses
+    def trim_primary_window_masses(self, masses: List[float]) -> List[float]:
+        """对一级窗口质量列表做百分位截尾，保留中间相对集中的窗口"""
+        indices = self.get_trim_indices(masses)
+        return [masses[i] for i in indices]
 
-        return trimmed if len(trimmed) >= self.config.MIN_TRIM_SAMPLES else masses
+    def aggregate_trip_mass_from_primary_windows(
+            self, primary_masses: List[float],
+            trim_reference: List[float] = None) -> Tuple[float, int, int]:
+        """
+        行程质量 = 一级窗口在行程级截尾后的中位数。
+        trim_reference: 用于决定截尾下标的参考序列（默认与 primary_masses 相同；
+                        预测时可用 ML 质量决定截尾，再同步作用于物理质量）。
+        返回: (中位数, 截尾后窗口数, 截尾前有效窗口数)
+        """
+        if len(primary_masses) == 0:
+            raise ValueError("一级窗口质量列表为空")
+        ref = trim_reference if trim_reference is not None else primary_masses
+        indices = self.get_trim_indices(ref)
+        trimmed = [primary_masses[i] for i in indices]
+        return float(np.median(trimmed)), len(indices), len(primary_masses)
 
     def extract_primary_window_features(self, primary_window: pd.DataFrame,
                                        m_est_result: Dict[str, Any]) -> Optional[Dict[str, float]]:
@@ -520,7 +481,6 @@ class PhysicsEstimator:
             m_est = m_est_result['m_est']
             m_est_cv = m_est_result['m_est_cv']
             n_secondary = m_est_result['n_secondary']
-            n_trimmed = m_est_result.get('n_trimmed', n_secondary)
 
             # 加速度特征
             accel_mean = float(np.mean(accel_values))
@@ -677,6 +637,13 @@ class PhysicsMLPredictor:
 
     def __init__(self, config: Config = None):
         self.config = config or Config()
+        if self.config.MIN_STOP_DURATION_FOR_SECTION_END <= self.config.MIN_STOP_DURATION_FOR_TRIP_END:
+            logger.warning(
+                f"区间停车阈值({self.config.MIN_STOP_DURATION_FOR_SECTION_END}s) "
+                f"≤ 行程阈值({self.config.MIN_STOP_DURATION_FOR_TRIP_END}s)，"
+                f"已自动修正区间为 600s"
+            )
+            self.config.MIN_STOP_DURATION_FOR_SECTION_END = 600.0
         self.cleaner = DataCleaner(self.config)
         self.physics_estimator = PhysicsEstimator(self.config)
         self.scaler = StandardScaler()
@@ -694,6 +661,30 @@ class PhysicsMLPredictor:
         self.training_metrics = {}
         self.training_history = {}
         self.residual_stats = {}
+        self.prediction_mode = self.config.PREDICTION_MODE
+
+    def _clamp_mass(self, mass) -> float:
+        """限制质量在合理范围"""
+        return float(np.clip(mass, self.config.MIN_MASS_KG, self.config.MAX_MASS_KG))
+
+    def _clamp_mass_array(self, masses: np.ndarray) -> np.ndarray:
+        return np.clip(masses, self.config.MIN_MASS_KG, self.config.MAX_MASS_KG)
+
+    def _apply_residual_correction(self, m_est: float, residual: float) -> float:
+        """将 ML 预测的残差叠加到物理估计上，并限制修正幅度"""
+        max_corr = max(200.0, abs(m_est) * self.config.MAX_RELATIVE_CORRECTION)
+        residual = float(np.clip(residual, -max_corr, max_corr))
+        return self._clamp_mass(m_est + residual)
+
+    def _predict_calibrated_mass(self, m_est: float, X_scaled: np.ndarray) -> Tuple[float, float]:
+        """
+        由特征预测校准质量。
+        返回 (校准质量, ML预测残差)
+        """
+        ml_out = float(self.ml_model.predict(X_scaled.reshape(1, -1) if X_scaled.ndim == 1 else X_scaled)[0])
+        if self.prediction_mode == 'residual':
+            return self._apply_residual_correction(m_est, ml_out), ml_out
+        return self._clamp_mass(ml_out), ml_out - m_est
 
     def train(self, df: pd.DataFrame, ml_model_type: str = 'gbdt',
               n_estimators: int = None, max_depth: int = None,
@@ -701,7 +692,8 @@ class PhysicsMLPredictor:
               min_samples_leaf: int = None, n_folds: int = None):
         """训练模型"""
         logger.info("=" * 60)
-        logger.info("开始训练物理+ML质量预测模型（带截尾处理）")
+        logger.info("开始训练物理+ML残差预测模型（行程窗口百分位截尾）")
+        logger.info(f"预测模式: {self.config.PREDICTION_MODE} (目标=m_true-m_est)")
         logger.info(f"ML参数: 类型={ml_model_type}, 树={n_estimators}, 深度={max_depth}, "
                     f"学习率={learning_rate}, 最小分割={min_samples_split}, "
                     f"最小叶子={min_samples_leaf}, CV折数={n_folds}")
@@ -737,9 +729,10 @@ class PhysicsMLPredictor:
         if len(trips) == 0:
             raise ValueError("未找到有效行程")
 
-        # 4. 提取所有行程的一级窗口特征
+        # 4. 提取所有行程的窗口特征
         all_features = []
-        all_labels = []
+        all_true_masses = []
+        all_m_est = []
         all_trip_ids = []
 
         prev_trip_mass = None  # 用于传递上一行程质量
@@ -763,7 +756,7 @@ class PhysicsMLPredictor:
 
             primary_windows = self.physics_estimator.split_primary_windows(trip_df)
 
-            logger.info(f"行程 {trip_idx}: 质量={trip_mass:.0f}kg, {len(primary_windows)} 个一级窗口")
+            logger.info(f"行程 {trip_idx}: 质量={trip_mass:.0f}kg, {len(primary_windows)} 个窗口")
 
             for primary_window in primary_windows:
                 m_est_result = self.physics_estimator.estimate_primary_window_mass(primary_window)
@@ -779,7 +772,8 @@ class PhysicsMLPredictor:
                     continue
 
                 all_features.append(features)
-                all_labels.append(trip_mass)
+                all_true_masses.append(trip_mass)
+                all_m_est.append(m_est_result['m_est'])
                 all_trip_ids.append(trip_idx)
 
             prev_trip_mass = trip_mass  # 更新上一行程质量
@@ -787,29 +781,38 @@ class PhysicsMLPredictor:
         if len(all_features) == 0:
             raise ValueError("未提取到有效训练特征")
 
-        # 5. 构建特征矩阵
+        # 5. 构建特征矩阵与残差标签
         X = pd.DataFrame(all_features)
         for feature in self.feature_names:
             if feature not in X.columns:
                 X[feature] = 0.0
 
         X = X[self.feature_names].values
-        y = np.array(all_labels)
+        m_est_arr = np.array(all_m_est)
+        y_true = np.array(all_true_masses)
+        y_residual = y_true - m_est_arr  # ML 学习目标：物理估计偏差
         groups = np.array(all_trip_ids)
 
-        logger.info(f"特征提取完成: {X.shape[0]} 个一级窗口样本, "
+        logger.info(f"特征提取完成: {X.shape[0]} 个窗口样本, "
                     f"{X.shape[1]} 个特征, {len(np.unique(groups))} 个行程")
+        logger.info(f"残差统计: mean={np.mean(y_residual):.0f}kg, "
+                    f"std={np.std(y_residual):.0f}kg, "
+                    f"|residual| median={np.median(np.abs(y_residual)):.0f}kg")
+
+        physics_mae = float(mean_absolute_error(y_true, m_est_arr))
+        logger.info(f"物理估计基线 MAE: {physics_mae:.0f} kg")
 
         # 6. 标准化
         X_scaled = self.scaler.fit_transform(X)
 
-        # 7. 交叉验证
+        # 7. 交叉验证（在最终质量上评估）
         cv_metrics, cv_predictions, cv_actuals = self._cross_validate(
-            X_scaled, y, groups, n_folds=self.config.CV_N_FOLDS
+            X_scaled, y_residual, m_est_arr, y_true, groups, n_folds=self.config.CV_N_FOLDS
         )
 
-        # 8. 训练最终模型
-        logger.info("训练最终ML模型...")
+        # 8. 训练最终残差模型
+        logger.info("训练最终ML残差模型...")
+        self.prediction_mode = self.config.PREDICTION_MODE
 
         if ml_model_type == 'linear':
             self.ml_model = LinearRegression()
@@ -832,49 +835,66 @@ class PhysicsMLPredictor:
                 random_state=self.config.RANDOM_STATE
             )
 
-        self.ml_model.fit(X_scaled, y)
+        self.ml_model.fit(X_scaled, y_residual)
 
-        # 9. 计算训练集上的预测
-        y_pred_train = self.ml_model.predict(X_scaled)
-        residuals = y - y_pred_train
+        # 9. 训练集预测：残差 → 校准质量
+        residual_pred = self.ml_model.predict(X_scaled)
+        y_pred_mass = self._clamp_mass_array(m_est_arr + residual_pred)
+        # 逐点应用修正幅度限制
+        for i in range(len(y_pred_mass)):
+            y_pred_mass[i] = self._apply_residual_correction(m_est_arr[i], residual_pred[i])
 
-        # 10. 计算残差统计
+        residuals = y_true - y_pred_mass
+
+        # 10. 计算残差统计（基于最终质量误差，用于置信度）
         self.residual_stats = self._compute_residual_stats(X, residuals)
 
         # 11. 保存训练历史
         self.training_history = {
             'X': X,
-            'y': y,
-            'y_pred': y_pred_train,
+            'y': y_true,
+            'm_est': m_est_arr,
+            'y_residual': y_residual,
+            'residual_pred': residual_pred,
+            'y_pred': y_pred_mass,
             'residuals': residuals,
             'groups': groups,
             'cv_predictions': cv_predictions,
             'cv_actuals': cv_actuals,
             'feature_importance': self._get_feature_importance(),
             'features_df': pd.DataFrame(all_features),
+            'prediction_mode': self.prediction_mode,
         }
+
+        ml_mae = float(mean_absolute_error(y_true, y_pred_mass))
+        improvement = (physics_mae - ml_mae) / max(physics_mae, 1) * 100
 
         # 12. 计算训练指标
         self.training_metrics = {
-            'mae_kg': float(mean_absolute_error(y, y_pred_train)),
-            'rmse_kg': float(np.sqrt(mean_squared_error(y, y_pred_train))),
-            'mape': float(np.mean(np.abs(residuals / y)) * 100),
-            'r2': float(r2_score(y, y_pred_train)),
-            'n_samples': len(y),
+            'mae_kg': ml_mae,
+            'rmse_kg': float(np.sqrt(mean_squared_error(y_true, y_pred_mass))),
+            'mape': float(np.mean(np.abs(residuals / y_true)) * 100),
+            'r2': float(r2_score(y_true, y_pred_mass)),
+            'physics_mae_kg': physics_mae,
+            'improvement_over_physics_pct': float(improvement),
+            'residual_mae_kg': float(mean_absolute_error(y_residual, residual_pred)),
+            'n_samples': len(y_true),
             'n_trips': len(np.unique(groups)),
+            'prediction_mode': self.prediction_mode,
             'cv_mae_mean': cv_metrics['mae_mean'],
             'cv_mae_std': cv_metrics['mae_std'],
             'cv_rmse_mean': cv_metrics['rmse_mean'],
             'cv_rmse_std': cv_metrics['rmse_std'],
             'cv_r2_mean': cv_metrics['r2_mean'],
+            'cv_physics_mae_mean': cv_metrics.get('physics_mae_mean', physics_mae),
             'cv_mae_values': cv_metrics.get('mae_values', []),
             'cv_r2_values': cv_metrics.get('r2_values', []),
         }
 
         self.is_trained = True
 
-        logger.info(f"训练完成: MAE={self.training_metrics['mae_kg']:.0f}kg, "
-                    f"MAPE={self.training_metrics['mape']:.1f}%, R²={self.training_metrics['r2']:.3f}")
+        logger.info(f"训练完成: 物理MAE={physics_mae:.0f}kg → ML MAE={ml_mae:.0f}kg "
+                    f"(改善{improvement:+.1f}%), R²={self.training_metrics['r2']:.3f}")
         logger.info(f"CV MAE: {cv_metrics['mae_mean']:.0f}±{cv_metrics['mae_std']:.0f}kg, "
                     f"CV R²: {cv_metrics['r2_mean']:.3f}")
 
@@ -889,25 +909,28 @@ class PhysicsMLPredictor:
 
         logger.info("=" * 60)
 
-    def _cross_validate(self, X, y, groups, n_folds=None):
-        """行程级别分组交叉验证"""
+    def _cross_validate(self, X, y_residual, m_est, y_true_mass, groups, n_folds=None):
+        """行程级别分组交叉验证（残差训练，质量评估）"""
         if n_folds is None:
             n_folds = self.config.CV_N_FOLDS
 
         n_folds = min(n_folds, len(np.unique(groups)))
-        logger.info(f"开始{n_folds}折分组交叉验证...")
+        logger.info(f"开始{n_folds}折分组交叉验证（残差模式）...")
 
         gkf = GroupKFold(n_splits=n_folds)
 
         mae_list = []
         rmse_list = []
         r2_list = []
-        all_cv_preds = np.zeros(len(y))
-        all_cv_actuals = y.copy()
+        physics_mae_list = []
+        all_cv_preds = np.zeros(len(y_true_mass))
+        all_cv_actuals = y_true_mass.copy()
 
-        for fold, (train_idx, test_idx) in enumerate(gkf.split(X, y, groups)):
+        for fold, (train_idx, test_idx) in enumerate(gkf.split(X, y_residual, groups)):
             X_train, X_test = X[train_idx], X[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
+            y_res_train = y_residual[train_idx]
+            m_est_test = m_est[test_idx]
+            y_mass_test = y_true_mass[test_idx]
 
             model_cv = GradientBoostingRegressor(
                 n_estimators=self.config.GBDT_N_ESTIMATORS,
@@ -917,20 +940,26 @@ class PhysicsMLPredictor:
                 min_samples_leaf=self.config.GBDT_MIN_SAMPLES_LEAF,
                 random_state=self.config.RANDOM_STATE
             )
-            model_cv.fit(X_train, y_train)
+            model_cv.fit(X_train, y_res_train)
 
-            y_pred = model_cv.predict(X_test)
-            all_cv_preds[test_idx] = y_pred
+            res_pred = model_cv.predict(X_test)
+            y_pred_mass = np.array([
+                self._apply_residual_correction(m_est_test[i], res_pred[i])
+                for i in range(len(m_est_test))
+            ])
+            all_cv_preds[test_idx] = y_pred_mass
 
-            mae = mean_absolute_error(y_test, y_pred)
-            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-            r2 = r2_score(y_test, y_pred)
+            mae = mean_absolute_error(y_mass_test, y_pred_mass)
+            rmse = np.sqrt(mean_squared_error(y_mass_test, y_pred_mass))
+            r2 = r2_score(y_mass_test, y_pred_mass)
+            phy_mae = mean_absolute_error(y_mass_test, m_est_test)
 
             mae_list.append(mae)
             rmse_list.append(rmse)
             r2_list.append(r2)
+            physics_mae_list.append(phy_mae)
 
-            logger.info(f"  第{fold + 1}折: MAE={mae:.0f}kg, RMSE={rmse:.0f}kg, R²={r2:.3f}")
+            logger.info(f"  第{fold + 1}折: 物理MAE={phy_mae:.0f}kg → ML MAE={mae:.0f}kg, R²={r2:.3f}")
 
         return {
             'mae_mean': float(np.mean(mae_list)),
@@ -938,6 +967,7 @@ class PhysicsMLPredictor:
             'rmse_mean': float(np.mean(rmse_list)),
             'rmse_std': float(np.std(rmse_list)),
             'r2_mean': float(np.mean(r2_list)),
+            'physics_mae_mean': float(np.mean(physics_mae_list)),
             'mae_values': [float(x) for x in mae_list],
             'r2_values': [float(x) for x in r2_list],
         }, all_cv_preds, all_cv_actuals
@@ -983,119 +1013,12 @@ class PhysicsMLPredictor:
             }).sort_values('importance', ascending=False)
         return None
 
-    def _calculate_data_quality_score(self, features: Dict[str, float]) -> float:
-        """计算数据质量分"""
-        score = 1.0
+        return None
 
-        n_sec = features.get('n_secondary', 0)
-        if n_sec < 2:
-            score *= 0.5
-        elif n_sec < 5:
-            score *= min(n_sec / 5, 1.0)
-
-        m_est_cv = features.get('m_est_cv', 0)
-        if m_est_cv > 0.15:
-            score *= 0.5
-        elif m_est_cv > 0.10:
-            score *= 0.7
-
-        accel_mean = features.get('accel_mean', 0)
-        if accel_mean < 1.2:
-            score *= 0.6
-        elif accel_mean < 1.5:
-            score *= 0.8
-
-        accel_quality = features.get('accel_quality', 0)
-        score *= max(0.3, accel_quality)
-
-        valid_ratio = features.get('valid_ratio', 0)
-        if valid_ratio < 0.6:
-            score *= 0.6
-
-        return float(max(0.1, min(1.0, score)))
-
-    def _calculate_model_reliability_score(self, features: Dict[str, float]) -> float:
-        """计算模型可靠度分"""
-        if not self.residual_stats:
-            return 0.5
-
-        m_est = features.get('m_est', 0)
-
-        bins = [0, 1500, 2000, 2500, 3000, 3500, 4000, 5000, np.inf]
-
-        bin_idx = 0
-        for i in range(len(bins)-1):
-            if bins[i] <= m_est < bins[i+1]:
-                bin_idx = i
-                break
-
-        bin_labels = ['<1500', '1500-2000', '2000-2500', '2500-3000',
-                     '3000-3500', '3500-4000', '4000-5000', '>5000']
-
-        if bin_idx < len(bin_labels):
-            bin_key = bin_labels[bin_idx]
-            if bin_key in self.residual_stats:
-                bin_mae = self.residual_stats[bin_key]['mae']
-                reliability = 1.0 - min(bin_mae / 400.0, 1.0)
-                return float(max(0.1, reliability))
-
-        global_mae = self.residual_stats['global']['mae']
-        reliability = 1.0 - min(global_mae / 400.0, 1.0)
-        return float(max(0.1, reliability))
-
-    def calculate_confidence(self, features: Dict[str, float]) -> float:
-        """计算综合置信度"""
-        data_quality = self._calculate_data_quality_score(features)
-        model_reliability = self._calculate_model_reliability_score(features)
-
-        confidence = (
-            self.config.DATA_QUALITY_WEIGHT * data_quality +
-            self.config.MODEL_RELIABILITY_WEIGHT * model_reliability
-        )
-
-        return float(max(0.05, min(1.0, confidence)))
-
-    def _calculate_trip_confidence(self, masses: List[float],
-                                   window_confidences: List[float]) -> float:
-        """计算行程级置信度"""
-        n = len(masses)
-
-        if n == 0:
-            return 0.0
-
-        if n >= 5:
-            count_score = 1.0
-        elif n >= 3:
-            count_score = 0.8
-        elif n >= 2:
-            count_score = 0.6
-        else:
-            count_score = 0.4
-
-        if n > 1:
-            cv = np.std(masses) / np.mean(masses)
-            if cv > 0.15:
-                consistency_score = 0.5
-            elif cv > 0.10:
-                consistency_score = 0.7
-            else:
-                consistency_score = 1.0
-        else:
-            consistency_score = 0.7
-
-        avg_window_conf = np.mean(window_confidences) if window_confidences else 0.5
-
-        trip_confidence = (count_score * 0.3 + consistency_score * 0.3 + avg_window_conf * 0.4)
-
-        return float(max(0.1, min(1.0, trip_confidence)))
-
-    def predict(self, df: pd.DataFrame, confidence_threshold: float = None) -> Dict[str, Any]:
+    def predict(self, df: pd.DataFrame) -> Dict[str, Any]:
         """预测新数据（区间聚合版本，不含对比分析）"""
-        if confidence_threshold is None:
-            confidence_threshold = self.config.CONFIDENCE_THRESHOLD
-
         logger.info("=" * 60)
-        logger.info(f"开始预测（区间聚合） (置信度阈值={confidence_threshold:.0%})")
+        logger.info("开始预测（区间聚合）")
         logger.info("=" * 60)
 
         if not self.is_trained:
@@ -1104,7 +1027,6 @@ class PhysicsMLPredictor:
         df_clean = self.cleaner.clean_data(df, is_training=False)
         original_df = df_clean.copy()
 
-        # 划分区间
         temp_df = df_clean.copy()
         if 'force_n' in temp_df.columns:
             temp_force_condition = temp_df['force_n'] > self.config.MIN_FORCE
@@ -1123,9 +1045,7 @@ class PhysicsMLPredictor:
         if len(sections) == 0:
             return self._create_empty_results(original_df)
 
-        # 初始化输出列
         original_df['predicted_mass'] = np.nan
-        original_df['prediction_confidence'] = 0.0
         original_df['trip_id'] = -1
         original_df['section_id'] = -1
         original_df['is_valid_prediction'] = False
@@ -1145,7 +1065,6 @@ class PhysicsMLPredictor:
                 continue
 
             section_trip_masses = []
-            section_trip_confidences = []
             section_trip_window_counts = []
 
             for trip_df in section_trips:
@@ -1167,7 +1086,6 @@ class PhysicsMLPredictor:
                     continue
 
                 trip_masses = []
-                trip_confidences = []
 
                 for primary_window in primary_windows:
                     m_est_result = self.physics_estimator.estimate_primary_window_mass(primary_window)
@@ -1189,12 +1107,9 @@ class PhysicsMLPredictor:
 
                     X_window = features_df[self.feature_names].values
                     X_window_scaled = self.scaler.transform(X_window)
-                    m_calibrated = float(self.ml_model.predict(X_window_scaled)[0])
-                    confidence = self.calculate_confidence(features)
-
-                    if confidence >= confidence_threshold:
-                        trip_masses.append(m_calibrated)
-                        trip_confidences.append(confidence)
+                    m_physical = m_est_result['m_est']
+                    m_calibrated, _ = self._predict_calibrated_mass(m_physical, X_window_scaled)
+                    trip_masses.append(m_calibrated)
 
                 if len(trip_masses) == 0:
                     trip_mask = (
@@ -1206,21 +1121,18 @@ class PhysicsMLPredictor:
                     global_trip_idx += 1
                     continue
 
-                trip_mass_final = float(np.median(trip_masses))
-                trip_confidence = self._calculate_trip_confidence(trip_masses, trip_confidences)
+                trip_mass_final, _, _ = self.physics_estimator.aggregate_trip_mass_from_primary_windows(trip_masses)
 
                 all_trip_results.append({
                     'trip_idx': global_trip_idx,
                     'section_id': section_idx,
                     'mass': trip_mass_final,
-                    'confidence': trip_confidence,
                     'n_windows': len(trip_masses),
                     'start_time': float(trip_df['time_seconds'].iloc[0]),
                     'end_time': float(trip_df['time_seconds'].iloc[-1]),
                 })
 
                 section_trip_masses.append(trip_mass_final)
-                section_trip_confidences.append(trip_confidence)
                 section_trip_window_counts.append(len(trip_masses))
 
                 trip_mask = (
@@ -1233,7 +1145,6 @@ class PhysicsMLPredictor:
                 global_prev_mass = trip_mass_final
                 global_trip_idx += 1
 
-            # 区间聚合
             if len(section_trip_masses) == 0:
                 continue
 
@@ -1243,16 +1154,9 @@ class PhysicsMLPredictor:
                 method='median'
             )
 
-            section_confidence = self._calculate_section_confidence(
-                section_trip_masses,
-                section_trip_confidences,
-                section_trip_window_counts
-            )
-
             section_result = {
                 'section_idx': section_idx,
                 'mass': section_mass,
-                'confidence': section_confidence,
                 'n_trips': len(section_trip_masses),
                 'n_total_windows': sum(section_trip_window_counts),
                 'start_time': float(section_df['time_seconds'].iloc[0]),
@@ -1261,17 +1165,14 @@ class PhysicsMLPredictor:
             }
             all_section_results.append(section_result)
 
-            # 用区间质量覆盖DataFrame
             section_mask = (
                     (original_df['time_seconds'] >= section_df['time_seconds'].iloc[0]) &
                     (original_df['time_seconds'] <= section_df['time_seconds'].iloc[-1])
             )
             original_df.loc[section_mask, 'predicted_mass'] = section_mass
-            original_df.loc[section_mask, 'prediction_confidence'] = section_confidence
             original_df.loc[section_mask, 'is_valid_prediction'] = True
             original_df.loc[section_mask, 'aggregation_level'] = 'section'
 
-        # 填充间隙
         original_df = self._fill_gaps_between_sections_simple(original_df, all_section_results)
 
         valid_points = original_df['is_valid_prediction'].sum()
@@ -1286,7 +1187,6 @@ class PhysicsMLPredictor:
             'total_points': total_points,
             'valid_points': int(valid_points),
             'valid_percentage': float(valid_points / total_points * 100) if total_points > 0 else 0.0,
-            'confidence_threshold': confidence_threshold,
         }
 
     def _fill_gaps_between_sections_simple(self, df: pd.DataFrame,
@@ -1301,7 +1201,6 @@ class PhysicsMLPredictor:
         if first_section['start_time'] > df['time_seconds'].iloc[0]:
             before_mask = df['time_seconds'] < first_section['start_time']
             df.loc[before_mask, 'predicted_mass'] = first_section['mass']
-            df.loc[before_mask, 'prediction_confidence'] = first_section['confidence'] * 0.3
             df.loc[before_mask, 'is_valid_prediction'] = False
             df.loc[before_mask, 'aggregation_level'] = 'inherited'
 
@@ -1315,7 +1214,6 @@ class PhysicsMLPredictor:
                         (df['time_seconds'] < next_s['start_time'])
                 )
                 df.loc[gap_mask, 'predicted_mass'] = curr['mass']
-                df.loc[gap_mask, 'prediction_confidence'] = curr['confidence'] * 0.3
                 df.loc[gap_mask, 'is_valid_prediction'] = False
                 df.loc[gap_mask, 'aggregation_level'] = 'inherited'
 
@@ -1323,7 +1221,6 @@ class PhysicsMLPredictor:
         if last_section['end_time'] < df['time_seconds'].iloc[-1]:
             after_mask = df['time_seconds'] > last_section['end_time']
             df.loc[after_mask, 'predicted_mass'] = last_section['mass']
-            df.loc[after_mask, 'prediction_confidence'] = last_section['confidence'] * 0.3
             df.loc[after_mask, 'is_valid_prediction'] = False
             df.loc[after_mask, 'aggregation_level'] = 'inherited'
 
@@ -1332,7 +1229,6 @@ class PhysicsMLPredictor:
     def _create_empty_results(self, df: pd.DataFrame) -> Dict[str, Any]:
         """创建空结果"""
         df['predicted_mass'] = np.nan
-        df['prediction_confidence'] = 0.0
         df['trip_id'] = -1
         df['section_id'] = -1
         df['is_valid_prediction'] = False
@@ -1344,7 +1240,6 @@ class PhysicsMLPredictor:
             'total_points': len(df),
             'valid_points': 0,
             'valid_percentage': 0.0,
-            'confidence_threshold': self.config.CONFIDENCE_THRESHOLD,
         }
 
     def _split_trips_with_temp_mask(self, df: pd.DataFrame) -> List[pd.DataFrame]:
@@ -1419,7 +1314,6 @@ class PhysicsMLPredictor:
         if first_trip['start_time'] > df['time_seconds'].iloc[0]:
             before_mask = df['time_seconds'] < first_trip['start_time']
             df.loc[before_mask, 'predicted_mass'] = first_trip['mass']
-            df.loc[before_mask, 'prediction_confidence'] = first_trip['confidence'] * 0.5
             df.loc[before_mask, 'is_valid_prediction'] = False
 
         for i in range(len(trip_results) - 1):
@@ -1432,14 +1326,12 @@ class PhysicsMLPredictor:
                     (df['time_seconds'] < next_trip['start_time'])
                 )
                 df.loc[gap_mask, 'predicted_mass'] = curr_trip['mass']
-                df.loc[gap_mask, 'prediction_confidence'] = curr_trip['confidence'] * 0.5
                 df.loc[gap_mask, 'is_valid_prediction'] = False
 
         last_trip = trip_results[-1]
         if last_trip['end_time'] < df['time_seconds'].iloc[-1]:
             after_mask = df['time_seconds'] > last_trip['end_time']
             df.loc[after_mask, 'predicted_mass'] = last_trip['mass']
-            df.loc[after_mask, 'prediction_confidence'] = last_trip['confidence'] * 0.5
             df.loc[after_mask, 'is_valid_prediction'] = False
 
         return df
@@ -1455,6 +1347,7 @@ class PhysicsMLPredictor:
             'training_history': self.training_history,
             'residual_stats': self.residual_stats,
             'feature_names': self.feature_names,
+            'prediction_mode': self.prediction_mode,
         }
         with open(filepath, 'wb') as f:
             pickle.dump(model_data, f)
@@ -1468,32 +1361,39 @@ class PhysicsMLPredictor:
         self.ml_model = model_data['ml_model']
         self.scaler = model_data['scaler']
         self.config = model_data['config']
+        if self.config.MIN_STOP_DURATION_FOR_SECTION_END <= self.config.MIN_STOP_DURATION_FOR_TRIP_END:
+            logger.warning(
+                f"加载模型：区间停车阈值({self.config.MIN_STOP_DURATION_FOR_SECTION_END}s) "
+                f"≤ 行程阈值({self.config.MIN_STOP_DURATION_FOR_TRIP_END}s)，已修正为 600s"
+            )
+            self.config.MIN_STOP_DURATION_FOR_SECTION_END = 600.0
+        if not hasattr(self.config, 'WINDOW_SIZE'):
+            self.config.WINDOW_SIZE = getattr(self.config, 'SECONDARY_WINDOW_SIZE', 3.0)
+        if not hasattr(self.config, 'MIN_WINDOW_POINTS'):
+            self.config.MIN_WINDOW_POINTS = getattr(self.config, 'MIN_SECONDARY_WINDOW_POINTS', 15)
+        self.config.SECONDARY_WINDOW_SIZE = self.config.WINDOW_SIZE
+        self.config.MIN_SECONDARY_WINDOW_POINTS = self.config.MIN_WINDOW_POINTS
         self.is_trained = model_data['is_trained']
         self.training_metrics = model_data.get('training_metrics', {})
         self.training_history = model_data.get('training_history', {})
         self.residual_stats = model_data.get('residual_stats', {})
         self.feature_names = model_data.get('feature_names', [])
-        logger.info(f"模型已从 {filepath} 加载")
+        self.prediction_mode = model_data.get('prediction_mode', 'absolute')
+        logger.info(f"模型已从 {filepath} 加载 (预测模式: {self.prediction_mode})")
 
-    # 在 physics_ml_classifier.py 的 PhysicsMLPredictor 类中添加新方法
 
-    def predict_with_comparison(self, df: pd.DataFrame, confidence_threshold: float = None) -> Dict[str, Any]:
+    def predict_with_comparison(self, df: pd.DataFrame) -> Dict[str, Any]:
         """预测新数据，按区间→行程→窗口层级聚合"""
-        if confidence_threshold is None:
-            confidence_threshold = self.config.CONFIDENCE_THRESHOLD
-
         logger.info("=" * 60)
-        logger.info(f"开始预测（含对比分析，区间聚合） (置信度阈值={confidence_threshold:.0%})")
+        logger.info(f"开始预测（含对比分析，区间聚合，模式={self.prediction_mode}）")
         logger.info("=" * 60)
 
         if not self.is_trained:
             raise ValueError("模型尚未训练")
 
-        # 1. 数据清洗
         df_clean = self.cleaner.clean_data(df, is_training=False)
         original_df = df_clean.copy()
 
-        # 2. 划分区间（停车>600s）
         temp_df = df_clean.copy()
         if 'force_n' in temp_df.columns:
             temp_force_condition = temp_df['force_n'] > self.config.MIN_FORCE
@@ -1507,64 +1407,53 @@ class PhysicsMLPredictor:
         temp_speed_condition = temp_df['speed_kmh'] > self.config.MIN_SPEED
         temp_df['is_valid_temp'] = (temp_speed_condition & temp_force_condition).astype(int)
 
-        # 先划分区间
         sections = self.physics_estimator.split_sections(temp_df)
 
         if len(sections) == 0:
             return self._create_empty_results_with_comparison(original_df)
 
-        # 3. 初始化输出DataFrame的列
         original_df['predicted_mass'] = np.nan
         original_df['physical_mass'] = np.nan
         original_df['ml_calibrated_mass'] = np.nan
-        original_df['prediction_confidence'] = 0.0
         original_df['trip_id'] = -1
-        original_df['section_id'] = -1  # 新增区间ID
+        original_df['section_id'] = -1
         original_df['is_valid_prediction'] = False
         original_df['improvement'] = np.nan
-        original_df['aggregation_level'] = 'none'  # 新增：标记聚合层级
+        original_df['aggregation_level'] = 'none'
 
         all_section_results = []
         all_trip_results = []
+        all_window_results = []
         global_prev_mass = None
-
-        # 全局行程计数器
         global_trip_idx = 0
 
-        # 4. 遍历每个区间
         for section_idx, section_df in enumerate(sections):
             logger.info(f"\n{'=' * 40}")
             logger.info(
                 f"处理区间 {section_idx}: {section_df['time_seconds'].iloc[0]:.0f}s - {section_df['time_seconds'].iloc[-1]:.0f}s")
             logger.info(f"{'=' * 40}")
 
-            # 4.1 在区间内划分行程（停车>2s或用户设置的值）
             section_trips = self.physics_estimator.split_trips_within_section(section_df)
 
             if len(section_trips) == 0:
                 logger.info(f"  区间 {section_idx}: 无有效行程")
                 continue
 
-            # 4.2 处理区间内的每个行程
             section_trip_masses = []
-            section_trip_confidences = []
             section_trip_window_counts = []
             section_trip_physical_masses = []
             section_trip_details = []
 
             for trip_idx_in_section, trip_df in enumerate(section_trips):
-                # 使用全局质量参考进行动态加速度阈值筛选
                 if global_prev_mass is not None:
                     trip_df = self.physics_estimator.filter_valid_points(trip_df, global_prev_mass)
                 else:
                     trip_df = self.physics_estimator.filter_valid_points(trip_df)
 
-                # 提取一级窗口
                 primary_windows = self.physics_estimator.split_primary_windows(trip_df)
 
                 if len(primary_windows) == 0:
                     logger.info(f"    行程 {global_trip_idx}: 无有效窗口")
-                    # 仍然标记行程范围
                     trip_mask = (
                             (original_df['time_seconds'] >= trip_df['time_seconds'].iloc[0]) &
                             (original_df['time_seconds'] <= trip_df['time_seconds'].iloc[-1])
@@ -1574,10 +1463,8 @@ class PhysicsMLPredictor:
                     global_trip_idx += 1
                     continue
 
-                # 处理窗口
                 trip_physical_masses = []
                 trip_calibrated_masses = []
-                trip_confidences = []
                 trip_window_details = []
 
                 for primary_window in primary_windows:
@@ -1593,7 +1480,6 @@ class PhysicsMLPredictor:
                     if features is None:
                         continue
 
-                    # ML校准
                     features_df = pd.DataFrame([features])
                     for fname in self.feature_names:
                         if fname not in features_df.columns:
@@ -1601,26 +1487,35 @@ class PhysicsMLPredictor:
 
                     X_window = features_df[self.feature_names].values
                     X_window_scaled = self.scaler.transform(X_window)
-                    m_calibrated = float(self.ml_model.predict(X_window_scaled)[0])
                     m_physical = m_est_result['m_est']
-                    confidence = self.calculate_confidence(features)
+                    m_calibrated, residual_pred = self._predict_calibrated_mass(m_physical, X_window_scaled)
+                    window_start = float(primary_window['time_seconds'].iloc[0])
+                    window_end = float(primary_window['time_seconds'].iloc[-1])
 
-                    if confidence >= confidence_threshold:
-                        trip_physical_masses.append(m_physical)
-                        trip_calibrated_masses.append(m_calibrated)
-                        trip_confidences.append(confidence)
-                        trip_window_details.append({
-                            'm_physical': m_physical,
-                            'm_calibrated': m_calibrated,
-                            'confidence': confidence,
-                            'n_secondary': m_est_result['n_secondary'],
-                            'n_trimmed': m_est_result.get('n_trimmed', 0),
-                            'improvement': abs(m_physical - m_calibrated) / max(m_physical,
-                                                                                1) * 100 if m_physical > 0 else 0,
-                        })
+                    all_window_results.append({
+                        'trip_idx': global_trip_idx,
+                        'section_idx': section_idx,
+                        'window_start': window_start,
+                        'window_end': window_end,
+                        'center_time': (window_start + window_end) / 2,
+                        'm_physical': m_physical,
+                        'm_ml': m_calibrated,
+                        'm_residual_pred': residual_pred,
+                        'n_secondary': m_est_result['n_secondary'],
+                    })
+
+                    trip_physical_masses.append(m_physical)
+                    trip_calibrated_masses.append(m_calibrated)
+                    trip_window_details.append({
+                        'm_physical': m_physical,
+                        'm_calibrated': m_calibrated,
+                        'n_secondary': m_est_result['n_secondary'],
+                        'improvement': abs(m_physical - m_calibrated) / max(m_physical,
+                                                                            1) * 100 if m_physical > 0 else 0,
+                    })
 
                 if len(trip_calibrated_masses) == 0:
-                    logger.info(f"    行程 {global_trip_idx}: 0/{len(primary_windows)} 个有效窗口 (均低于置信度阈值)")
+                    logger.info(f"    行程 {global_trip_idx}: 0/{len(primary_windows)} 个有效窗口")
                     trip_mask = (
                             (original_df['time_seconds'] >= trip_df['time_seconds'].iloc[0]) &
                             (original_df['time_seconds'] <= trip_df['time_seconds'].iloc[-1])
@@ -1630,23 +1525,23 @@ class PhysicsMLPredictor:
                     global_trip_idx += 1
                     continue
 
-                # 计算行程级别的质量
-                trip_physical_final = float(np.median(trip_physical_masses))
-                trip_calibrated_final = float(np.median(trip_calibrated_masses))
-                trip_confidence = self._calculate_trip_confidence(trip_calibrated_masses, trip_confidences)
+                trip_physical_final, n_after_trim, n_valid_windows = (
+                    self.physics_estimator.aggregate_trip_mass_from_primary_windows(
+                        trip_physical_masses, trim_reference=trip_calibrated_masses))
+                trip_calibrated_final, _, _ = (
+                    self.physics_estimator.aggregate_trip_mass_from_primary_windows(
+                        trip_calibrated_masses, trim_reference=trip_calibrated_masses))
                 improvement_pct = abs(trip_physical_final - trip_calibrated_final) / max(trip_physical_final, 1) * 100
 
-                # 记录行程结果
                 trip_result = {
                     'trip_idx': global_trip_idx,
                     'section_id': section_idx,
                     'mass': trip_calibrated_final,
                     'physical_mass': trip_physical_final,
                     'ml_mass': trip_calibrated_final,
-                    'confidence': trip_confidence,
-                    'n_windows': len(trip_calibrated_masses),
-                    'n_total_windows': len(primary_windows),
-                    'n_filtered_windows': len(primary_windows) - len(trip_calibrated_masses),
+                    'n_windows': n_valid_windows,
+                    'n_windows_after_trim': n_after_trim,
+                    'n_primary_windows': len(primary_windows),
                     'improvement_pct': improvement_pct,
                     'physical_std': float(np.std(trip_physical_masses)) if len(trip_physical_masses) > 1 else 0.0,
                     'ml_std': float(np.std(trip_calibrated_masses)) if len(trip_calibrated_masses) > 1 else 0.0,
@@ -1656,14 +1551,11 @@ class PhysicsMLPredictor:
                 }
                 all_trip_results.append(trip_result)
 
-                # 收集区间级别的数据
                 section_trip_masses.append(trip_calibrated_final)
-                section_trip_confidences.append(trip_confidence)
                 section_trip_window_counts.append(len(trip_calibrated_masses))
                 section_trip_physical_masses.append(trip_physical_final)
                 section_trip_details.append(trip_result)
 
-                # 填充行程级别的数据到DataFrame
                 trip_mask = (
                         (original_df['time_seconds'] >= trip_df['time_seconds'].iloc[0]) &
                         (original_df['time_seconds'] <= trip_df['time_seconds'].iloc[-1])
@@ -1673,58 +1565,41 @@ class PhysicsMLPredictor:
                 original_df.loc[trip_mask, 'predicted_mass'] = trip_calibrated_final
                 original_df.loc[trip_mask, 'physical_mass'] = trip_physical_final
                 original_df.loc[trip_mask, 'ml_calibrated_mass'] = trip_calibrated_final
-                original_df.loc[trip_mask, 'prediction_confidence'] = trip_confidence
                 original_df.loc[trip_mask, 'is_valid_prediction'] = True
                 original_df.loc[trip_mask, 'improvement'] = improvement_pct
                 original_df.loc[trip_mask, 'aggregation_level'] = 'trip'
 
-                # 更新全局质量参考
                 global_prev_mass = trip_calibrated_final
 
                 logger.info(
                     f"    行程 {global_trip_idx}: 物理={trip_physical_final:.0f}kg → ML={trip_calibrated_final:.0f}kg, "
-                    f"改进={improvement_pct:.1f}%, 置信度={trip_confidence:.2f}, "
-                    f"有效窗口={len(trip_calibrated_masses)}/{len(primary_windows)}")
+                    f"改进={improvement_pct:.1f}%, "
+                    f"截尾={n_after_trim}/{n_valid_windows} (窗口共{len(primary_windows)}个)")
 
                 global_trip_idx += 1
 
-            # 4.3 区间级别的聚合
             if len(section_trip_masses) == 0:
                 logger.info(f"  区间 {section_idx}: 无有效行程，跳过区间聚合")
                 continue
 
-            # 聚合区间质量（使用中位数）
             section_mass = self._aggregate_section_mass(
                 section_trip_masses,
                 section_trip_window_counts,
                 method='median'
             )
 
-            # 计算区间置信度
-            section_confidence = self._calculate_section_confidence(
-                section_trip_masses,
-                section_trip_confidences,
-                section_trip_window_counts
-            )
-
-            # 区间物理估计（取各行程物理估计的中位数）
             section_physical_mass = float(np.median(section_trip_physical_masses))
-
-            # 区间改进幅度
             section_improvement = abs(section_physical_mass - section_mass) / max(section_physical_mass, 1) * 100
 
-            # 区间结果
             section_result = {
                 'section_idx': section_idx,
                 'mass': section_mass,
                 'physical_mass': section_physical_mass,
                 'ml_mass': section_mass,
-                'confidence': section_confidence,
                 'n_trips': len(section_trip_masses),
                 'n_total_windows': sum(section_trip_window_counts),
                 'improvement_pct': section_improvement,
                 'trip_masses': section_trip_masses,
-                'trip_confidences': section_trip_confidences,
                 'trip_window_counts': section_trip_window_counts,
                 'physical_std': float(np.std(section_trip_physical_masses)) if len(
                     section_trip_physical_masses) > 1 else 0.0,
@@ -1736,7 +1611,6 @@ class PhysicsMLPredictor:
             }
             all_section_results.append(section_result)
 
-            # 用区间级别的质量覆盖DataFrame（覆盖行程级别的填充）
             section_mask = (
                     (original_df['time_seconds'] >= section_df['time_seconds'].iloc[0]) &
                     (original_df['time_seconds'] <= section_df['time_seconds'].iloc[-1])
@@ -1744,22 +1618,18 @@ class PhysicsMLPredictor:
             original_df.loc[section_mask, 'predicted_mass'] = section_mass
             original_df.loc[section_mask, 'physical_mass'] = section_physical_mass
             original_df.loc[section_mask, 'ml_calibrated_mass'] = section_mass
-            original_df.loc[section_mask, 'prediction_confidence'] = section_confidence
             original_df.loc[section_mask, 'is_valid_prediction'] = True
             original_df.loc[section_mask, 'improvement'] = section_improvement
             original_df.loc[section_mask, 'aggregation_level'] = 'section'
 
             logger.info(f"  区间 {section_idx} 聚合结果: {len(section_trip_masses)}个行程, "
                         f"物理={section_physical_mass:.0f}kg → ML={section_mass:.0f}kg, "
-                        f"改进={section_improvement:.1f}%, 置信度={section_confidence:.2f}")
+                        f"改进={section_improvement:.1f}%")
 
-            # 输出行程对比
             logger.info(f"  区间内行程质量分布: {[f'{m:.0f}' for m in section_trip_masses]}")
 
-        # 5. 填充区间间的间隙
         original_df = self._fill_gaps_between_sections(original_df, all_section_results)
 
-        # 6. 统计输出
         valid_points = original_df['is_valid_prediction'].sum()
         total_points = len(original_df)
 
@@ -1771,12 +1641,12 @@ class PhysicsMLPredictor:
 
         return {
             'predictions_df': original_df,
-            'section_results': all_section_results,  # 区间级结果（主要输出）
-            'trip_results': all_trip_results,  # 行程级结果（辅助输出）
+            'section_results': all_section_results,
+            'trip_results': all_trip_results,
+            'window_results': all_window_results,
             'total_points': total_points,
             'valid_points': int(valid_points),
             'valid_percentage': float(valid_points / total_points * 100) if total_points > 0 else 0.0,
-            'confidence_threshold': confidence_threshold,
         }
 
     def _create_empty_results_with_comparison(self, df: pd.DataFrame) -> Dict[str, Any]:
@@ -1784,7 +1654,6 @@ class PhysicsMLPredictor:
         df['predicted_mass'] = np.nan
         df['physical_mass'] = np.nan
         df['ml_calibrated_mass'] = np.nan
-        df['prediction_confidence'] = 0.0
         df['trip_id'] = -1
         df['section_id'] = -1
         df['is_valid_prediction'] = False
@@ -1794,10 +1663,10 @@ class PhysicsMLPredictor:
             'predictions_df': df,
             'section_results': [],
             'trip_results': [],
+            'window_results': [],
             'total_points': len(df),
             'valid_points': 0,
             'valid_percentage': 0.0,
-            'confidence_threshold': self.config.CONFIDENCE_THRESHOLD,
         }
 
     def _fill_gaps_between_trips_with_comparison(self, df: pd.DataFrame,
@@ -1814,7 +1683,6 @@ class PhysicsMLPredictor:
             df.loc[before_mask, 'predicted_mass'] = first_trip['ml_mass']
             df.loc[before_mask, 'physical_mass'] = first_trip['physical_mass']
             df.loc[before_mask, 'ml_calibrated_mass'] = first_trip['ml_mass']
-            df.loc[before_mask, 'prediction_confidence'] = first_trip['confidence'] * 0.5
             df.loc[before_mask, 'is_valid_prediction'] = False
 
         for i in range(len(trip_results) - 1):
@@ -1829,7 +1697,6 @@ class PhysicsMLPredictor:
                 df.loc[gap_mask, 'predicted_mass'] = curr_trip['ml_mass']
                 df.loc[gap_mask, 'physical_mass'] = curr_trip['physical_mass']
                 df.loc[gap_mask, 'ml_calibrated_mass'] = curr_trip['ml_mass']
-                df.loc[gap_mask, 'prediction_confidence'] = curr_trip['confidence'] * 0.5
                 df.loc[gap_mask, 'is_valid_prediction'] = False
 
         last_trip = trip_results[-1]
@@ -1838,67 +1705,9 @@ class PhysicsMLPredictor:
             df.loc[after_mask, 'predicted_mass'] = last_trip['ml_mass']
             df.loc[after_mask, 'physical_mass'] = last_trip['physical_mass']
             df.loc[after_mask, 'ml_calibrated_mass'] = last_trip['ml_mass']
-            df.loc[after_mask, 'prediction_confidence'] = last_trip['confidence'] * 0.5
             df.loc[after_mask, 'is_valid_prediction'] = False
 
         return df
-
-    def _calculate_section_confidence(self, trip_masses: List[float],
-                                      trip_confidences: List[float],
-                                      trip_window_counts: List[int]) -> float:
-        """计算区间级别的置信度"""
-        n = len(trip_masses)
-
-        if n == 0:
-            return 0.0
-
-        # 1. 行程数量评分
-        if n >= 5:
-            count_score = 1.0
-        elif n >= 3:
-            count_score = 0.8
-        elif n >= 2:
-            count_score = 0.6
-        else:
-            count_score = 0.4
-
-        # 2. 行程间一致性评分
-        if n > 1:
-            cv = np.std(trip_masses) / np.mean(trip_masses)
-            if cv > 0.15:
-                consistency_score = 0.5
-            elif cv > 0.10:
-                consistency_score = 0.7
-            elif cv > 0.05:
-                consistency_score = 0.85
-            else:
-                consistency_score = 1.0
-        else:
-            consistency_score = 0.7
-
-        # 3. 窗口总数评分（窗口越多越可信）
-        total_windows = sum(trip_window_counts)
-        if total_windows >= 20:
-            window_score = 1.0
-        elif total_windows >= 10:
-            window_score = 0.8
-        elif total_windows >= 5:
-            window_score = 0.6
-        else:
-            window_score = 0.4
-
-        # 4. 行程平均置信度
-        avg_trip_conf = np.mean(trip_confidences) if trip_confidences else 0.5
-
-        # 综合评分
-        section_confidence = (
-                count_score * 0.25 +  # 行程数量
-                consistency_score * 0.30 +  # 行程间一致性
-                window_score * 0.15 +  # 窗口总数
-                avg_trip_conf * 0.30  # 行程平均置信度
-        )
-
-        return float(max(0.1, min(1.0, section_confidence)))
 
     def _aggregate_section_mass(self, trip_masses: List[float],
                                 trip_window_counts: List[int],
@@ -1954,7 +1763,6 @@ class PhysicsMLPredictor:
             df.loc[before_mask, 'predicted_mass'] = first_section['ml_mass']
             df.loc[before_mask, 'physical_mass'] = first_section['physical_mass']
             df.loc[before_mask, 'ml_calibrated_mass'] = first_section['ml_mass']
-            df.loc[before_mask, 'prediction_confidence'] = first_section['confidence'] * 0.3
             df.loc[before_mask, 'is_valid_prediction'] = False
             df.loc[before_mask, 'aggregation_level'] = 'inherited'
             df.loc[before_mask, 'section_id'] = -1
@@ -1969,11 +1777,9 @@ class PhysicsMLPredictor:
                         (df['time_seconds'] > curr_section['end_time']) &
                         (df['time_seconds'] < next_section['start_time'])
                 )
-                # 使用前一个区间的质量
                 df.loc[gap_mask, 'predicted_mass'] = curr_section['ml_mass']
                 df.loc[gap_mask, 'physical_mass'] = curr_section['physical_mass']
                 df.loc[gap_mask, 'ml_calibrated_mass'] = curr_section['ml_mass']
-                df.loc[gap_mask, 'prediction_confidence'] = curr_section['confidence'] * 0.3
                 df.loc[gap_mask, 'is_valid_prediction'] = False
                 df.loc[gap_mask, 'aggregation_level'] = 'inherited'
                 df.loc[gap_mask, 'section_id'] = -1
@@ -1985,7 +1791,6 @@ class PhysicsMLPredictor:
             df.loc[after_mask, 'predicted_mass'] = last_section['ml_mass']
             df.loc[after_mask, 'physical_mass'] = last_section['physical_mass']
             df.loc[after_mask, 'ml_calibrated_mass'] = last_section['ml_mass']
-            df.loc[after_mask, 'prediction_confidence'] = last_section['confidence'] * 0.3
             df.loc[after_mask, 'is_valid_prediction'] = False
             df.loc[after_mask, 'aggregation_level'] = 'inherited'
             df.loc[after_mask, 'section_id'] = -1

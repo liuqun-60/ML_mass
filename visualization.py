@@ -127,7 +127,7 @@ def plot_feature_importance(training_history: Dict) -> Optional[go.Figure]:
     ])
 
     fig.update_layout(
-        title='特征重要性排名',
+        title='残差预测特征重要性 (Δm = m_true - m_est)',
         xaxis_title='重要性',
         yaxis_title='特征',
         height=500,
@@ -222,8 +222,80 @@ def plot_residual_by_region(training_history: Dict) -> Optional[go.Figure]:
     return fig
 
 
+def plot_raw_data_distributions(df: pd.DataFrame) -> Optional[go.Figure]:
+    """原始数据关键字段分布（数据探索参考，最多 4 个子图）"""
+    if df is None or len(df) == 0:
+        return None
+
+    panel_defs = [
+        ('speed_kmh', '车速 (km/h)', '#3B82F6', 10.0),
+        ('acceleration_x', '加速度 (m/s²)', '#10B981', 1.0),
+        ('force_n', '牵引力 (N)', '#F97316', 2000.0),
+        ('mass_kg', '标注质量 (kg)', '#8B5CF6', None),
+    ]
+    if 'force_n' not in df.columns and 'motor_torque_nm' in df.columns:
+        panel_defs[2] = ('motor_torque_nm', '电机扭矩 (Nm)', '#F97316', None)
+
+    panels = []
+    for col, label, color, threshold in panel_defs:
+        if col not in df.columns:
+            continue
+        series = pd.to_numeric(df[col], errors='coerce').dropna()
+        if len(series) == 0:
+            continue
+        panels.append((series.values, label, color, threshold))
+
+    if not panels:
+        return None
+
+    n_panels = len(panels)
+    n_cols = 2 if n_panels > 1 else 1
+    n_rows = (n_panels + n_cols - 1) // n_cols
+
+    fig = make_subplots(
+        rows=n_rows,
+        cols=n_cols,
+        subplot_titles=[p[1] for p in panels],
+        horizontal_spacing=0.08,
+        vertical_spacing=0.12,
+    )
+
+    for idx, (values, label, color, threshold) in enumerate(panels):
+        row = idx // n_cols + 1
+        col = idx % n_cols + 1
+        fig.add_trace(
+            go.Histogram(
+                x=values, nbinsx=40, marker_color=color,
+                name=label, showlegend=False,
+            ),
+            row=row, col=col,
+        )
+        if threshold is not None:
+            fig.add_vline(
+                x=threshold, line_dash='dash', line_color='#EF4444',
+                line_width=1.5, row=row, col=col,
+            )
+
+    fig.update_layout(
+        title=dict(
+            text='原始数据关键字段分布',
+            x=0.5,
+            xanchor='center',
+            y=0.98,
+            yanchor='top',
+        ),
+        template='plotly_white',
+        height=280 * n_rows + 60,
+        margin=dict(l=50, r=30, t=70, b=40),
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(title_text='频次', showgrid=True, gridcolor='#E5E7EB')
+
+    return fig
+
+
 def plot_window_comparison(training_history: Dict) -> Optional[go.Figure]:
-    """绘制每个窗口的物理估计、ML校准与实际质量的对比"""
+    """绘制行程级别物理估计、ML校准与实际质量对比"""
     if training_history is None or training_history.get('X') is None:
         return None
 
@@ -231,163 +303,65 @@ def plot_window_comparison(training_history: Dict) -> Optional[go.Figure]:
     y_true = training_history['y']
     y_pred = training_history['y_pred']
     groups = training_history['groups']
-    residuals = training_history['residuals']
 
     m_est_values = X[:, 0]
-    n_secondary_values = X[:, 2]
-    m_est_cv_values = X[:, 1]
-    accel_values = X[:, 3]
-
     window_df = pd.DataFrame({
-        'window_id': np.arange(len(y_true)),
         'trip_id': groups,
         'm_physical': m_est_values,
         'm_calibrated': y_pred,
         'm_true': y_true,
-        'residual': residuals,
-        'abs_residual': np.abs(residuals),
-        'n_secondary': n_secondary_values,
-        'm_est_cv': m_est_cv_values,
-        'accel_mean': accel_values,
     })
-
-    window_df['trip_window_idx'] = window_df.groupby('trip_id').cumcount()
+    trip_df = window_df.groupby('trip_id', as_index=False).agg(
+        m_physical=('m_physical', 'median'),
+        m_calibrated=('m_calibrated', 'median'),
+        m_true=('m_true', 'first'),
+    ).sort_values('trip_id')
+    trip_df['abs_error'] = np.abs(trip_df['m_true'] - trip_df['m_calibrated'])
+    trip_df['trip_idx'] = np.arange(len(trip_df))
 
     fig = make_subplots(
-        rows=3, cols=2,
+        rows=1, cols=2,
         subplot_titles=(
-            '所有窗口：物理估计 vs ML校准 vs 真实质量',
-            '按行程：窗口质量对比',
-            '误差 vs 物理估计值',
-            '误差 vs 窗口内一致性 (m_est_cv)',
-            '误差 vs 二级窗口数量',
-            '误差 vs 加速度均值'
+            '行程级：物理估计 vs 残差校准 vs 真实质量',
+            '校准后绝对误差 vs 行程物理估计',
         ),
-        vertical_spacing=0.12,
         horizontal_spacing=0.10,
     )
 
-    unique_trips = np.unique(groups)
-    colors = px.colors.qualitative.Plotly[:len(unique_trips)]
-    trip_color_map = {trip: colors[i % len(colors)] for i, trip in enumerate(unique_trips)}
-
-    def hex_to_rgba(hex_color, alpha=0.3):
-        hex_color = hex_color.lstrip('#')
-        if len(hex_color) == 6:
-            r = int(hex_color[0:2], 16)
-            g = int(hex_color[2:4], 16)
-            b = int(hex_color[4:6], 16)
-        else:
-            r, g, b = 0, 0, 0
-        return f'rgba({r},{g},{b},{alpha})'
-
-    # 子图1：所有窗口的对比
-    sorted_idx = np.argsort(window_df['trip_id'].values * 1000 + window_df['trip_window_idx'].values)
-
     fig.add_trace(
-        go.Scatter(x=np.arange(len(y_true)), y=m_est_values[sorted_idx],
-                   mode='markers', marker=dict(size=4, opacity=0.5, color='blue'),
-                   name='物理估计', legendgroup='physical'),
+        go.Scatter(x=trip_df['trip_idx'], y=trip_df['m_physical'],
+                   mode='markers', marker=dict(size=10, opacity=0.75, color='#3B82F6'),
+                   name='物理估计'),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=trip_df['trip_idx'], y=trip_df['m_calibrated'],
+                   mode='markers', marker=dict(size=10, opacity=0.75, color='#10B981'),
+                   name='残差校准 (m_est+Δm)'),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=trip_df['trip_idx'], y=trip_df['m_true'],
+                   mode='markers', marker=dict(size=10, opacity=0.65, color='#EF4444', symbol='x'),
+                   name='真实质量'),
         row=1, col=1
     )
 
     fig.add_trace(
-        go.Scatter(x=np.arange(len(y_true)), y=y_pred[sorted_idx],
-                   mode='markers', marker=dict(size=4, opacity=0.5, color='green'),
-                   name='ML校准', legendgroup='calibrated'),
-        row=1, col=1
+        go.Scatter(x=trip_df['m_physical'], y=trip_df['abs_error'], mode='markers',
+                   marker=dict(size=10, color='#6366F1', opacity=0.7),
+                   name='行程误差'),
+        row=1, col=2
     )
+    mean_err = float(np.mean(trip_df['abs_error']))
+    fig.add_hline(y=mean_err, line=dict(dash='dash', color='red'),
+                  annotation_text=f'平均误差:{mean_err:.0f}kg', row=1, col=2)
 
-    fig.add_trace(
-        go.Scatter(x=np.arange(len(y_true)), y=y_true[sorted_idx],
-                   mode='markers', marker=dict(size=4, opacity=0.5, color='red', symbol='x'),
-                   name='真实质量', legendgroup='true'),
-        row=1, col=1
-    )
-
-    # 子图2：按行程的窗口对比
-    for trip_id in unique_trips:
-        trip_mask = window_df['trip_id'] == trip_id
-        trip_data = window_df[trip_mask].sort_values('trip_window_idx')
-
-        color = trip_color_map[trip_id]
-        rgba_color_light = hex_to_rgba(color, 0.2)
-        rgba_color_medium = hex_to_rgba(color, 0.5)
-
-        fig.add_trace(
-            go.Scatter(x=trip_data['trip_window_idx'], y=trip_data['m_physical'],
-                       mode='lines+markers', marker=dict(size=4, color=rgba_color_medium),
-                       line=dict(dash='dot', width=1, color=rgba_color_medium),
-                       name=f'行程{trip_id}物理', legendgroup=f'trip{trip_id}', showlegend=True),
-            row=1, col=2
-        )
-
-        fig.add_trace(
-            go.Scatter(x=trip_data['trip_window_idx'], y=trip_data['m_calibrated'],
-                       mode='lines+markers', marker=dict(size=4, color=color),
-                       line=dict(dash='solid', width=1.5, color=color),
-                       name=f'行程{trip_id}ML', legendgroup=f'trip{trip_id}', showlegend=True),
-            row=1, col=2
-        )
-
-        true_mass = trip_data['m_true'].iloc[0]
-        fig.add_hline(y=true_mass, line=dict(dash='solid', width=2, color=rgba_color_light), row=1, col=2)
-
-    # 子图3：误差 vs 物理估计值
-    fig.add_trace(
-        go.Scatter(x=m_est_values, y=np.abs(residuals), mode='markers',
-                   marker=dict(size=8, color=accel_values, colorscale='Viridis',
-                               colorbar=dict(title='加速度(m/s²)'), opacity=0.6),
-                   text=[f'窗口{i}<br>物理:{m_est_values[i]:.0f}kg<br>误差:{abs(residuals[i]):.0f}kg'
-                         for i in range(len(m_est_values))],
-                   hoverinfo='text', name='窗口误差'),
-        row=2, col=1
-    )
-    fig.add_hline(y=np.mean(np.abs(residuals)), line=dict(dash='dash', color='rgba(255,0,0,0.7)'),
-                  annotation_text=f'平均误差:{np.mean(np.abs(residuals)):.0f}kg', row=2, col=1)
-
-    # 子图4：误差 vs m_est_cv
-    fig.add_trace(
-        go.Scatter(x=m_est_cv_values, y=np.abs(residuals), mode='markers',
-                   marker=dict(size=8, color=n_secondary_values, colorscale='RdYlBu',
-                               colorbar=dict(title='二级窗口数'), opacity=0.6),
-                   text=[f'窗口{i}<br>CV:{m_est_cv_values[i]:.3f}<br>误差:{abs(residuals[i]):.0f}kg'
-                         for i in range(len(m_est_cv_values))],
-                   hoverinfo='text', name='窗口误差'),
-        row=2, col=2
-    )
-
-    # 子图5：误差 vs 二级窗口数量
-    fig.add_trace(
-        go.Box(x=n_secondary_values, y=np.abs(residuals),
-               name='误差分布', marker_color='#3B82F6', boxmean='sd'),
-        row=3, col=1
-    )
-
-    # 子图6：误差 vs 加速度均值
-    fig.add_trace(
-        go.Scatter(x=accel_values, y=np.abs(residuals), mode='markers',
-                   marker=dict(size=10, color=m_est_cv_values, colorscale='RdYlGn_r',
-                               colorbar=dict(title='m_est_cv'), opacity=0.6),
-                   text=[f'窗口{i}<br>加速度:{accel_values[i]:.2f}<br>误差:{abs(residuals[i]):.0f}kg'
-                         for i in range(len(accel_values))],
-                   hoverinfo='text', name='窗口误差'),
-        row=3, col=2
-    )
-
-    fig.update_layout(height=1200, title_text="窗口级别质量对比与误差分析", hovermode='closest')
-    fig.update_xaxes(title_text="窗口序号", row=1, col=1)
+    fig.update_layout(height=450, title_text="行程级别质量对比与误差分析", hovermode='closest')
+    fig.update_xaxes(title_text="行程序号", row=1, col=1)
     fig.update_yaxes(title_text="质量 (kg)", row=1, col=1)
-    fig.update_xaxes(title_text="行程内窗口序号", row=1, col=2)
-    fig.update_yaxes(title_text="质量 (kg)", row=1, col=2)
-    fig.update_xaxes(title_text="物理估计值 (kg)", row=2, col=1)
-    fig.update_yaxes(title_text="绝对误差 (kg)", row=2, col=1)
-    fig.update_xaxes(title_text="m_est_cv", row=2, col=2)
-    fig.update_yaxes(title_text="绝对误差 (kg)", row=2, col=2)
-    fig.update_xaxes(title_text="二级窗口数量", row=3, col=1)
-    fig.update_yaxes(title_text="绝对误差 (kg)", row=3, col=1)
-    fig.update_xaxes(title_text="加速度均值 (m/s²)", row=3, col=2)
-    fig.update_yaxes(title_text="绝对误差 (kg)", row=3, col=2)
+    fig.update_xaxes(title_text="行程物理估计 (kg)", row=1, col=2)
+    fig.update_yaxes(title_text="绝对误差 (kg)", row=1, col=2)
 
     return fig
 
@@ -972,88 +946,408 @@ def plot_physical_vs_ml_comparison(trip_results: List[Dict]) -> Optional[go.Figu
     return fig
 
 
-def generate_mass_time_curve_with_comparison(predictions_df: pd.DataFrame) -> Optional[io.BytesIO]:
-    """生成带对比的质量时间曲线（显示物理估计和ML校准两条线）"""
+def _draw_step_line(ax, segments, color, label, linestyle='-', linewidth=2.5, alpha=1.0):
+    """绘制阶梯线（用于行程/区间中位数曲线）"""
+    if not segments:
+        return
+    times, masses = [], []
+    for seg in segments:
+        times.extend([seg['start'], seg['end']])
+        masses.extend([seg['mass'], seg['mass']])
+    ax.plot(times, masses, color=color, linestyle=linestyle, linewidth=linewidth,
+            alpha=alpha, label=label, drawstyle='steps-post')
+
+
+def _render_mass_time_curve_on_ax(
+        ax,
+        predictions_df: pd.DataFrame,
+        window_results: List[Dict] = None,
+        trip_results: List[Dict] = None,
+        section_results: List[Dict] = None,
+):
+    """在指定 axes 上绘制质量时间曲线（窗口散点 + 行程/区间阶梯线）"""
+    scatter_artists = {}
+
+    if window_results:
+        times = [w['center_time'] for w in window_results]
+        m_phy = [w['m_physical'] for w in window_results]
+        m_ml = [w['m_ml'] for w in window_results]
+
+        scatter_artists['physical'] = ax.scatter(
+            times, m_phy,
+            s=60, c='#3B82F6', marker='o', alpha=0.85, zorder=5,
+            label='窗口物理估计 (F=ma)', edgecolors='white', linewidths=0.5,
+        )
+        scatter_artists['ml'] = ax.scatter(
+            times, m_ml,
+            s=60, c='#10B981', marker='^', alpha=0.85, zorder=5,
+            label='窗口残差校准 (m_est+Δm)', edgecolors='white', linewidths=0.5,
+        )
+
+    if trip_results:
+        trip_segments = [
+            {'start': t['start_time'], 'end': t['end_time'], 'mass': t['ml_mass']}
+            for t in trip_results
+        ]
+        _draw_step_line(ax, trip_segments, '#8B5CF6', '行程中位数 (ML)',
+                        linestyle='--', linewidth=1.2, alpha=0.45)
+
+        trip_phy_segments = [
+            {'start': t['start_time'], 'end': t['end_time'], 'mass': t['physical_mass']}
+            for t in trip_results
+        ]
+        _draw_step_line(ax, trip_phy_segments, '#6366F1', '行程中位数 (物理)',
+                        linestyle=':', linewidth=1.0, alpha=0.35)
+
+    if section_results:
+        section_segments = [
+            {'start': s['start_time'], 'end': s['end_time'], 'mass': s['ml_mass']}
+            for s in section_results
+        ]
+        _draw_step_line(ax, section_segments, '#F97316', '区间中位数 (最终输出)',
+                        linestyle='-', linewidth=3.0, alpha=0.95)
+
+    if 'is_valid_prediction' in predictions_df.columns and 'predicted_mass' in predictions_df.columns:
+        inherited = predictions_df[
+            (~predictions_df['is_valid_prediction']) & predictions_df['predicted_mass'].notna()
+        ]
+        if len(inherited) > 0:
+            ax.scatter(
+                inherited['time_seconds'].values,
+                inherited['predicted_mass'].values,
+                s=3, c='#9CA3AF', alpha=0.25, label='继承值（停车间隙）',
+            )
+
+    ax.set_xlabel('时间 (秒)', fontsize=12)
+    ax.set_ylabel('质量 (kg)', fontsize=12)
+    ax.set_title('质量预测时间曲线：窗口估计 → 行程中位数 → 区间中位数',
+                 fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.legend(loc='upper right', fontsize=9, ncol=2)
+
+    n_windows = len(window_results) if window_results else 0
+    stats_lines = [f"窗口总数: {n_windows}"]
+    if window_results:
+        phy_med = np.median([w['m_physical'] for w in window_results])
+        ml_med = np.median([w['m_ml'] for w in window_results])
+        stats_lines.append(f"窗口物理中位数: {phy_med:.0f} kg")
+        stats_lines.append(f"窗口ML中位数: {ml_med:.0f} kg")
+        stats_lines.append(f"物理-ML差异: {abs(phy_med - ml_med):.0f} kg")
+    if section_results:
+        stats_lines.append(f"区间数: {len(section_results)}")
+        stats_lines.append(
+            f"区间ML中位数: {np.median([s['ml_mass'] for s in section_results]):.0f} kg"
+        )
+
+    ax.text(0.02, 0.98, '\n'.join(stats_lines), transform=ax.transAxes,
+            fontsize=9, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+    return scatter_artists
+
+
+def _build_section_and_inherited_segments(
+        section_results: List[Dict],
+        time_start: float,
+        time_end: float,
+        mass_key: str = 'ml_mass',
+) -> tuple:
+    """
+    按区间构建阶梯线段（有效区 + 继承区），每段仅 start/end 两个点，不展开原始采样率。
+    mass_key: 'ml_mass' 或 'physical_mass'，物理/ML 共用同一套继承逻辑。
+    """
+    if not section_results:
+        return [], []
+
+    sections = sorted(section_results, key=lambda x: x['start_time'])
+    valid_segments = [
+        {'start': s['start_time'], 'end': s['end_time'], 'mass': s[mass_key]}
+        for s in sections
+    ]
+    inherited_segments = []
+
+    first = sections[0]
+    if first['start_time'] > time_start:
+        inherited_segments.append({
+            'start': time_start,
+            'end': first['start_time'],
+            'mass': first[mass_key],
+        })
+
+    for i in range(len(sections) - 1):
+        curr, nxt = sections[i], sections[i + 1]
+        if curr['end_time'] < nxt['start_time']:
+            inherited_segments.append({
+                'start': curr['end_time'],
+                'end': nxt['start_time'],
+                'mass': curr[mass_key],
+            })
+
+    last = sections[-1]
+    if last['end_time'] < time_end:
+        inherited_segments.append({
+            'start': last['end_time'],
+            'end': time_end,
+            'mass': last[mass_key],
+        })
+
+    return valid_segments, inherited_segments
+
+
+def _plotly_step_segments(segments: List[Dict], color: str, name: str,
+                          dash: str = 'solid', width: float = 2.5,
+                          opacity: float = 1.0) -> Optional[go.Scatter]:
+    """Plotly 阶梯线：每段仅 start/end 两个点"""
+    if not segments:
+        return None
+    xs, ys = [], []
+    for seg in segments:
+        xs.extend([seg['start'], seg['end'], None])
+        ys.extend([seg['mass'], seg['mass'], None])
+    return go.Scatter(
+        x=xs, y=ys, mode='lines', name=name,
+        line=dict(color=color, width=width, dash=dash),
+        opacity=opacity,
+        connectgaps=False,
+        hovertemplate=f'{name}<br>时间: %{{x:.1f}} s<br>质量: %{{y:.0f}} kg<extra></extra>',
+    )
+
+
+def _section_output_segments(
+        section_results: List[Dict],
+        time_start: float,
+        time_end: float,
+        mass_key: str = 'ml_mass',
+) -> List[Dict]:
+    """区间有效段 + 继承段合并，用于绘制含继承的最终输出曲线。"""
+    valid, inherited = _build_section_and_inherited_segments(
+        section_results, time_start, time_end, mass_key=mass_key,
+    )
+    return valid + inherited
+
+
+def plot_mass_time_curve_interactive(
+        predictions_df: pd.DataFrame,
+        window_results: List[Dict] = None,
+        trip_results: List[Dict] = None,
+        section_results: List[Dict] = None,
+        show_window_points: bool = False,
+) -> Optional[go.Figure]:
+    """
+    质量时间曲线（精简对比版）：
+    1. 行程散点：圆点=原始物理估计，三角=ML 调整后
+    2. ML 区间中位数最终输出（实线，含继承）
+    3. 物理区间中位数（虚线，继承逻辑与 ML 一致）
+    """
     try:
-        required_cols = ['time_seconds', 'physical_mass', 'ml_calibrated_mass']
-        if not all(col in predictions_df.columns for col in required_cols):
+        if 'time_seconds' not in predictions_df.columns:
             return None
 
-        total_points = len(predictions_df)
-        if total_points > 50000:
-            step = max(1, total_points // 50000)
-            plot_df = predictions_df.iloc[::step].copy()
-        else:
-            plot_df = predictions_df.copy()
+        time_vals = pd.to_numeric(predictions_df['time_seconds'], errors='coerce').dropna()
+        if len(time_vals) == 0:
+            return None
+        time_start = float(time_vals.min())
+        time_end = float(time_vals.max())
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
+        fig = go.Figure()
 
-        # 子图1：两条曲线对比
-        valid_mask = plot_df['physical_mass'].notna()
+        # --- 1. 物理区间中位数（虚线，含继承）---
+        if section_results:
+            phy_segments = _section_output_segments(
+                section_results, time_start, time_end, mass_key='physical_mass',
+            )
+            phy_trace = _plotly_step_segments(
+                phy_segments, '#3B82F6', '物理区间中位数（含继承）',
+                dash='dash', width=2.5, opacity=0.85,
+            )
+            if phy_trace:
+                fig.add_trace(phy_trace)
 
-        if valid_mask.any():
-            valid_data = plot_df[valid_mask]
-            time_valid = valid_data['time_seconds'].values
+        # --- 2. ML 区间中位数最终输出（实线，含继承）---
+        if section_results:
+            ml_segments = _section_output_segments(
+                section_results, time_start, time_end, mass_key='ml_mass',
+            )
+            ml_trace = _plotly_step_segments(
+                ml_segments, '#B45309', 'ML 区间中位数（最终输出，含继承）',
+                dash='solid', width=3.0, opacity=1.0,
+            )
+            if ml_trace:
+                fig.add_trace(ml_trace)
 
-            # 物理估计曲线
-            physical_valid = valid_data['physical_mass'].values
-            ax1.plot(time_valid, physical_valid, 'b-', alpha=0.7, linewidth=1.5,
-                     label='物理估计 (F=ma)')
+        # --- 3. 行程散点：圆=物理，三角=ML ---
+        if trip_results:
+            sorted_trips = sorted(trip_results, key=lambda x: x['start_time'])
+            trip_centers = [(t['start_time'] + t['end_time']) / 2 for t in sorted_trips]
+            trip_phy = [t['physical_mass'] for t in sorted_trips]
+            trip_ml = [t['ml_mass'] for t in sorted_trips]
+            phy_labels = [
+                f"行程 {t.get('trip_idx', i)}<br>物理: {t['physical_mass']:.0f} kg"
+                for i, t in enumerate(sorted_trips)
+            ]
+            ml_labels = [
+                f"行程 {t.get('trip_idx', i)}<br>ML: {t['ml_mass']:.0f} kg<br>"
+                f"较物理 Δ{abs(t['ml_mass'] - t['physical_mass']):.0f} kg"
+                for i, t in enumerate(sorted_trips)
+            ]
+            fig.add_trace(go.Scatter(
+                x=trip_centers, y=trip_phy, mode='markers',
+                name='行程物理估计',
+                marker=dict(size=10, color='#3B82F6', symbol='circle',
+                            line=dict(width=1.5, color='white')),
+                text=phy_labels, hoverinfo='text',
+            ))
+            fig.add_trace(go.Scatter(
+                x=trip_centers, y=trip_ml, mode='markers',
+                name='行程 ML 调整',
+                marker=dict(size=10, color='#10B981', symbol='triangle-up',
+                            line=dict(width=1.5, color='white')),
+                text=ml_labels, hoverinfo='text',
+            ))
 
-            # ML校准曲线
-            ml_valid = valid_data['ml_calibrated_mass'].values
-            ax1.plot(time_valid, ml_valid, 'g-', alpha=0.7, linewidth=1.5,
-                     label='ML校准', marker='o', markersize=2, markevery=max(1, len(time_valid)//100))
+        fig.update_layout(
+            title=dict(
+                text='质量预测时间曲线（物理 vs ML）',
+                x=0.5,
+                xanchor='center',
+            ),
+            xaxis_title='时间 (秒)',
+            yaxis_title='质量 (kg)',
+            template='plotly_white',
+            height=560,
+            hovermode='closest',
+            legend=dict(
+                orientation='h',
+                yref='paper',
+                yanchor='top',
+                y=-0.18,
+                xanchor='center',
+                x=0.5,
+            ),
+            margin=dict(l=60, r=30, t=60, b=100),
+        )
+        fig.update_xaxes(showgrid=True, gridcolor='#E5E7EB')
+        fig.update_yaxes(showgrid=True, gridcolor='#E5E7EB')
 
-        # 填充物理估计和ML校准之间的区域
-        if valid_mask.any():
-            valid_data = plot_df[valid_mask]
-            ax1.fill_between(valid_data['time_seconds'].values,
-                            valid_data['physical_mass'].values,
-                            valid_data['ml_calibrated_mass'].values,
-                            alpha=0.3, color='orange', label='改进区域')
+        return fig
+    except Exception as e:
+        print(f"生成 Plotly 曲线失败: {str(e)}")
+        return None
 
-        ax1.set_xlabel('时间 (秒)', fontsize=12)
-        ax1.set_ylabel('质量 (kg)', fontsize=12)
-        ax1.set_title('物理估计 vs ML校准 质量时间曲线', fontsize=14, fontweight='bold')
-        ax1.legend(loc='upper right')
-        ax1.grid(True, alpha=0.3, linestyle='--')
 
-        # 子图2：置信度曲线
-        if 'prediction_confidence' in plot_df.columns:
-            confidence_valid = plot_df.loc[valid_mask, 'prediction_confidence'].values if valid_mask.any() else []
-            if len(confidence_valid) > 0:
-                ax2.fill_between(time_valid, 0, confidence_valid, alpha=0.5, color='teal')
-                ax2.plot(time_valid, confidence_valid, 'teal-', alpha=0.8, linewidth=1.5)
-                ax2.axhline(y=0.7, color='red', linestyle='--', alpha=0.5, label='阈值线 (0.7)')
+def generate_mass_time_curve_with_comparison(
+        predictions_df: pd.DataFrame,
+        window_results: List[Dict] = None,
+        trip_results: List[Dict] = None,
+        section_results: List[Dict] = None,
+        confidence_threshold: float = 0.7,
+) -> Optional[io.BytesIO]:
+    """
+    质量预测时间曲线：窗口级物理/ML散点 + 行程/区间中位数阶梯线
+    帮助区分是物理估计偏差还是 ML 模型偏差
+    """
+    try:
+        if 'time_seconds' not in predictions_df.columns:
+            return None
 
-        ax2.set_xlabel('时间 (秒)', fontsize=12)
-        ax2.set_ylabel('置信度', fontsize=12)
-        ax2.set_title('预测置信度时间曲线', fontsize=14, fontweight='bold')
-        ax2.set_ylim(0, 1.05)
-        ax2.grid(True, alpha=0.3, linestyle='--')
+        fig, ax = plt.subplots(figsize=(16, 7))
 
-        # 添加统计信息
-        improvements = plot_df.loc[valid_mask, 'improvement'].dropna() if 'improvement' in plot_df.columns else pd.Series()
-        stats_text = f"总点数: {total_points:,}\n"
-        stats_text += f"有效预测点: {valid_mask.sum():,} ({valid_mask.sum()/total_points*100:.1f}%)\n"
-        if len(improvements) > 0:
-            stats_text += f"平均改进幅度: {improvements.mean():.1f}%\n"
-            stats_text += f"最大改进幅度: {improvements.max():.1f}%"
-        else:
-            if valid_mask.any():
-                ml_median = plot_df.loc[valid_mask, 'ml_calibrated_mass'].median()
-                physical_median = plot_df.loc[valid_mask, 'physical_mass'].median()
-                stats_text += f"ML中位数: {ml_median:.0f} kg\n"
-                stats_text += f"物理中位数: {physical_median:.0f} kg\n"
-                stats_text += f"差异: {abs(ml_median - physical_median):.0f} kg"
+        # --- 1. 窗口级散点 ---
+        if window_results:
+            passed = [w for w in window_results if w.get('passed_threshold', True)]
+            filtered = [w for w in window_results if not w.get('passed_threshold', True)]
 
-        ax1.text(0.02, 0.98, stats_text, transform=ax1.transAxes,
+            if passed:
+                ax.scatter(
+                    [w['center_time'] for w in passed],
+                    [w['m_physical'] for w in passed],
+                    s=60, c='#3B82F6', marker='o', alpha=0.85, zorder=5,
+                    label='窗口物理估计 (F=ma)', edgecolors='white', linewidths=0.5,
+                )
+                ax.scatter(
+                    [w['center_time'] for w in passed],
+                    [w['m_ml'] for w in passed],
+                    s=60, c='#10B981', marker='^', alpha=0.85, zorder=5,
+                    label='窗口残差校准 (m_est+Δm)', edgecolors='white', linewidths=0.5,
+                )
+
+            if filtered:
+                ax.scatter(
+                    [w['center_time'] for w in filtered],
+                    [w['m_physical'] for w in filtered],
+                    s=40, c='#93C5FD', marker='o', alpha=0.4, zorder=4,
+                    label=f'物理估计（置信度<{confidence_threshold:.0%}）',
+                )
+                ax.scatter(
+                    [w['center_time'] for w in filtered],
+                    [w['m_ml'] for w in filtered],
+                    s=40, c='#86EFAC', marker='^', alpha=0.4, zorder=4,
+                    label=f'ML校准（置信度<{confidence_threshold:.0%}）',
+                )
+
+        # --- 2. 行程级中位数阶梯线 ---
+        if trip_results:
+            trip_segments = [
+                {'start': t['start_time'], 'end': t['end_time'], 'mass': t['ml_mass']}
+                for t in trip_results
+            ]
+            _draw_step_line(ax, trip_segments, '#8B5CF6', '行程中位数 (ML)',
+                            linestyle='--', linewidth=2.0, alpha=0.8)
+
+            trip_phy_segments = [
+                {'start': t['start_time'], 'end': t['end_time'], 'mass': t['physical_mass']}
+                for t in trip_results
+            ]
+            _draw_step_line(ax, trip_phy_segments, '#6366F1', '行程中位数 (物理)',
+                            linestyle=':', linewidth=1.5, alpha=0.6)
+
+        # --- 3. 区间级中位数阶梯线（最终输出） ---
+        if section_results:
+            section_segments = [
+                {'start': s['start_time'], 'end': s['end_time'], 'mass': s['ml_mass']}
+                for s in section_results
+            ]
+            _draw_step_line(ax, section_segments, '#F97316', '区间中位数 (最终输出)',
+                            linestyle='-', linewidth=3.0, alpha=0.95)
+
+        # --- 4. 继承区域背景 ---
+        if 'is_valid_prediction' in predictions_df.columns and 'predicted_mass' in predictions_df.columns:
+            inherited = predictions_df[
+                (~predictions_df['is_valid_prediction']) & predictions_df['predicted_mass'].notna()
+            ]
+            if len(inherited) > 0:
+                ax.scatter(
+                    inherited['time_seconds'].values,
+                    inherited['predicted_mass'].values,
+                    s=3, c='#9CA3AF', alpha=0.25, label='继承值（低置信度区间）',
+                )
+
+        ax.set_xlabel('时间 (秒)', fontsize=12)
+        ax.set_ylabel('质量 (kg)', fontsize=12)
+        ax.set_title('质量预测时间曲线：窗口估计 → 行程中位数 → 区间中位数', fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.legend(loc='upper right', fontsize=9, ncol=2)
+
+        # 统计信息
+        n_windows = len(window_results) if window_results else 0
+        n_passed = sum(1 for w in (window_results or []) if w.get('passed_threshold'))
+        stats_lines = [f"窗口总数: {n_windows}", f"通过置信度阈值: {n_passed}"]
+        if window_results and n_passed > 0:
+            passed_w = [w for w in window_results if w.get('passed_threshold')]
+            phy_med = np.median([w['m_physical'] for w in passed_w])
+            ml_med = np.median([w['m_ml'] for w in passed_w])
+            stats_lines.append(f"窗口物理中位数: {phy_med:.0f} kg")
+            stats_lines.append(f"窗口ML中位数: {ml_med:.0f} kg")
+            stats_lines.append(f"物理-ML差异: {abs(phy_med - ml_med):.0f} kg")
+        if section_results:
+            stats_lines.append(f"区间数: {len(section_results)}")
+            stats_lines.append(f"区间ML中位数: {np.median([s['ml_mass'] for s in section_results]):.0f} kg")
+
+        ax.text(0.02, 0.98, '\n'.join(stats_lines), transform=ax.transAxes,
                 fontsize=9, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
 
         plt.tight_layout()
-
         buf = io.BytesIO()
         plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
         plt.close(fig)
