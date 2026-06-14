@@ -216,12 +216,13 @@ def main():
                 st.dataframe(df.head(20))
 
             st.markdown("### 📊 原始数据分布")
-            fig_dist = plot_raw_data_distributions(df)
+            with st.spinner("正在生成分布预览..."):
+                fig_dist = plot_raw_data_distributions(df)
             if fig_dist is not None:
                 st.plotly_chart(fig_dist, width='stretch')
                 st.caption(
-                    "车速 / 加速度 / 牵引力分布供参考；"
-                    "红色虚线为当前默认筛选阈值（车速>10 km/h、加速度>1.0 m/s²、牵引力>2000 N）"
+                    "大文件自动抽样展示；红色虚线为默认筛选阈值。"
+                    "质量档位按全量计数，其余字段为直方图概览。"
                 )
             else:
                 st.info("未找到可绘制的数值字段（需含 speed_kmh、acceleration_x、force_n 或 mass_kg 等列）")
